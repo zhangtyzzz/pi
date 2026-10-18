@@ -1,0 +1,88 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 23:33 Asia/Singapore (UTC+08:00).
+    - cron: '33 15 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'zhangtyzzz/pi' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Check out the trusted main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream while retaining fork workflow policy
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags https://github.com/earendil-works/pi.git \
+            main:refs/remotes/upstream/main
+          upstream="$(git rev-parse refs/remotes/upstream/main)"
+          echo "Upstream: $upstream" >> "$GITHUB_STEP_SUMMARY"
+
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Already up to date; no merge or CI dispatch needed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          merge_status=0
+          git merge --no-commit --no-ff "$upstream" || merge_status=$?
+          # Exit on non-conflict errors before staging anything.
+          git rev-parse --verify MERGE_HEAD >/dev/null
+          if (( merge_status > 1 )); then
+            exit "$merge_status"
+          fi
+
+          # Workflow files belong to this fork. Restore the exact trusted tree,
+          # including deletions, even if upstream modifies or adds workflows.
+          # No upstream scripts, package lifecycle hooks or models run here.
+          git rm -r -f -- .github/workflows
+          git restore --source="$GITHUB_SHA" --staged --worktree -- .github/workflows
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$conflicts" ]]; then
+            printf '::error::Manual resolution required outside .github/workflows\n%s\n' "$conflicts"
+            exit 1
+          fi
+          git diff --cached --exit-code "$GITHUB_SHA" -- .github/workflows
+          git commit -m "chore: sync upstream ${upstream:0:12}"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Push without overwriting concurrent changes
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push origin HEAD:refs/heads/main
+          echo "Merged: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start CI explicitly after the bot push
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref main
