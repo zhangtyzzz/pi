@@ -1,4 +1,4 @@
-import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
+import { type Context, copyJson, type Draft } from "@earendil-works/chord";
 import type {
 	Api,
 	AssistantMessage,
@@ -31,8 +31,8 @@ import type {
 import { addTools, sectionExtension } from "./agent.ts";
 import { compactionPolicy, createCompaction, estimateContext, selectCut } from "./compaction.ts";
 import { applyBoundary, type Boundary, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";
-import { assignJson } from "./json.ts";
-import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
+import { endRun, LiveDoc, type LiveState, PROGRESS_COMMIT, type ToolSlot } from "./live.ts";
+import { PartialChanges, type PartialMessage } from "./partial-changes.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { ensureProviderSessionId } from "./provider.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
@@ -440,8 +440,10 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
- * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle and awaits that
- * commit, so no stale partial lands after the outcome.
+ * `progress.partialIntervalMs` (default 100 ms) with one commit in flight, deferred (`PROGRESS_COMMIT`); `finally` stops
+ * the throttle and awaits that commit, so no stale partial lands after the outcome. A commit appends what text and
+ * thinking grew by and applies the argument changes since the last one (`PartialChanges`), so its cost follows the new
+ * text, not the strings' length.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -456,20 +458,32 @@ async function streamResponse(
 	let timer: (() => void) | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
+	const changes = new PartialChanges();
 	const flush = (): void => {
 		timer = undefined;
 		const partial = pending;
 		pending = undefined;
 		if (partial === undefined || stopped) return;
 		inFlight = (async () => {
-			// Copy synchronously: the provider keeps mutating its partial.
-			const message = copyJson(partial, { omitUndefinedProperties: true });
-			await runtime.commit(async (tx) => {
-				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				live.generation ??= { attempt };
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-				return undefined;
-			}, context);
+			// Copy synchronously: the provider keeps mutating its partial. The changes since the last commit belong to it.
+			// `copyJson()` returns untyped JSON; a copy of a message is that message's JSON representation.
+			const message = copyJson(partial, { omitUndefinedProperties: true }) as PartialMessage;
+			const taken = changes.take(message);
+			try {
+				await runtime.commit(
+					async (tx) => {
+						const live = await tx.doc(LiveDoc, runtime.conversationId);
+						live.generation ??= { attempt };
+						changes.commit(live.generation, message, taken);
+						return undefined;
+					},
+					context,
+					PROGRESS_COMMIT,
+				);
+			} catch (error) {
+				changes.restore(taken);
+				throw error;
+			}
 		})()
 			.catch((error: unknown) => {
 				// Rejections after an abort mark or close are expected; the committed state stays consistent.
@@ -486,6 +500,7 @@ async function streamResponse(
 			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
+			changes.observe(event);
 			pending = event.partial;
 			if (timer === undefined && inFlight === undefined) timer = runtime.setTimer(flush, interval);
 		}
