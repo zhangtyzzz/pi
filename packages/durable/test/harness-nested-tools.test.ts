@@ -38,7 +38,7 @@ import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat } from "./chat-support.ts";
 import { addHooks, addTool } from "./harness-support.ts";
 import { endedAt, nestedResultOf, nestedResults, slotsOf, startOrder, viewHistory } from "./live-support.ts";
-import { context } from "./session-support.ts";
+import { context, onValue } from "./session-support.ts";
 import { aborted, deferred, eventually } from "./task-support.ts";
 
 const Parameters = Type.Object({ text: Type.Optional(Type.String()) });
@@ -870,12 +870,14 @@ describe("nested tool calls", () => {
 		// Each value's operations rebuild the next one, the late subscriber's starting value included.
 		let replayed = watch.value;
 		const outputs: [string | undefined, string | undefined][] = [];
-		watch.start(async ({ value, ops }) => {
-			replayed = applyImmutable(replayed, ops);
-			expect(replayed).toEqual(value);
-			const [one, two] = nestedOf(value);
-			outputs.push([one?.output, two?.output]);
-		});
+		watch.start(
+			onValue(async ({ value, ops }) => {
+				replayed = applyImmutable(replayed, ops);
+				expect(replayed).toEqual(value);
+				const [one, two] = nestedOf(value);
+				outputs.push([one?.output, two?.output]);
+			}),
+		);
 		// The second slot writes first, so a wrong slot index in the update path would show.
 		wrote.two.resolve();
 		await eventually(() => outputs.at(-1)?.[1] === "two\n");
@@ -1231,14 +1233,34 @@ describe("nested tool calls", () => {
 			checkpoint: { phase: "call" },
 		});
 	});
+
+	// #11043
+	it("keeps version 2 tool task input as it is", () => {
+		const migrate = ToolTask.definition.migrate!;
+		const model = { kind: "model", assistant: 3, callId: "c1" };
+		const nested = {
+			kind: "nested",
+			parent: 7,
+			parentCallId: "c1",
+			key: "k",
+			call: { type: "toolCall", id: "c1/k", name: "echo", arguments: {} },
+		};
+		expect(migrate(model, { phase: "call" }, 2).input).toEqual(model);
+		expect(migrate(nested, { phase: "call" }, 2).input).toEqual(nested);
+	});
 });
 
-describe("tool task version 1 records", () => {
+describe("tool task version 1 and 2 records", () => {
 	/**
-	 * Store a live tool task for call `c1` of an assistant entry, close, and rewrite its record as version 1 stored it:
-	 * `{ assistant, callId }` input at version 1, with `checkpoint`. Returns the storage path and the task ID.
+	 * Store a live tool task for call `c1` of an assistant entry, close, and rewrite its record as `version` stored it,
+	 * with `checkpoint`: version 1 had `{ assistant, callId }` input, version 2 added `kind`. Returns the storage path
+	 * and the task ID.
 	 */
-	async function storeVersion1(setup: ChatSetup, checkpoint: JsonValue): Promise<{ path: string; id: TaskId }> {
+	async function storeVersion(
+		setup: ChatSetup,
+		checkpoint: JsonValue,
+		version: 1 | 2 = 1,
+	): Promise<{ path: string; id: TaskId }> {
 		const directory = await mkdtemp(join(tmpdir(), "pi-durable-tool-v1-"));
 		directories.add(directory);
 		const path = join(directory, "session.sqlite");
@@ -1255,10 +1277,11 @@ describe("tool task version 1 records", () => {
 		await harness.close(context);
 		const storage = await openNodeSqliteStorage(path);
 		const record = (await storage.task(id, context))!;
-		const { kind: _kind, ...input } = record.input as Extract<ToolTaskInput, { kind: "model" }>;
+		const { kind: _kind, ...version1 } = record.input as Extract<ToolTaskInput, { kind: "model" }>;
+		const input = version === 1 ? version1 : record.input;
 		const state = { ...record.state, checkpoint } as typeof record.state;
 		await storage.commit(
-			[{ type: "task", value: { ...record, version: 1, input, state } as typeof record }],
+			[{ type: "task", value: { ...record, version, input, state } as typeof record }],
 			() => {},
 			context,
 		);
@@ -1270,12 +1293,12 @@ describe("tool task version 1 records", () => {
 		const setup = chatSetup();
 		const echo = echoTool();
 		addTool(setup.registry, echo.registration);
-		const { path, id } = await storeVersion1(setup, { phase: "call" });
+		const { path, id } = await storeVersion(setup, { phase: "call" });
 		const { harness, root } = await openChat(await openNodeSqliteStorage(path), setup);
 		expect((await harness.getTask(id, context))?.version).toBe(1);
 		harness.resume();
 		const settled = await harness.waitForTask(id, context);
-		expect(settled.version).toBe(2);
+		expect(settled.version).toBe(3);
 		expect(settled.input).toMatchObject({ kind: "model", callId: "c1" });
 		expect(settled.state.outcome).toMatchObject({ status: "completed", result: { kind: "model" } });
 		expect(echo.state.runs).toBe(1);
@@ -1289,16 +1312,35 @@ describe("tool task version 1 records", () => {
 		const echo = echoTool();
 		addTool(setup.registry, echo.registration);
 		const intent = { phase: "execute", arguments: { text: "old" }, replay: "unsafe" };
-		const { path, id } = await storeVersion1(setup, intent);
+		const { path, id } = await storeVersion(setup, intent);
 		const { harness, root } = await openChat(await openNodeSqliteStorage(path), setup);
 		harness.resume();
 		const settled = await harness.waitForTask(id, context);
-		expect(settled.version).toBe(2);
+		expect(settled.version).toBe(3);
 		expect(settled.state.outcome).toMatchObject({ status: "failed", result: { kind: "model" } });
 		expect(echo.state.runs).toBe(0);
 		const [result] = results(await allEntries(root));
 		expect(result).toMatchObject({ toolCallId: "c1", isError: true });
 		expect(text(result)).toContain("Tool echo was interrupted");
+		await harness.close(context);
+	});
+
+	// #11043
+	it("reserves a stored version 2 task under version 3 and runs it as a model-issued call", async () => {
+		const setup = chatSetup();
+		const echo = echoTool();
+		addTool(setup.registry, echo.registration);
+		const { path, id } = await storeVersion(setup, { phase: "call" }, 2);
+		const { harness, root } = await openChat(await openNodeSqliteStorage(path), setup);
+		expect((await harness.getTask(id, context))?.version).toBe(2);
+		harness.resume();
+		const settled = await harness.waitForTask(id, context);
+		expect(settled.version).toBe(3);
+		expect(settled.input).toEqual({ kind: "model", assistant: expect.any(Number), callId: "c1" });
+		expect(settled.state.outcome).toMatchObject({ status: "completed", result: { kind: "model" } });
+		expect(echo.state.runs).toBe(1);
+		const [result] = results(await allEntries(root));
+		expect([result!.toolCallId, text(result)]).toEqual(["c1", "echo old"]);
 		await harness.close(context);
 	});
 });

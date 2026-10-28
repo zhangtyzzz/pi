@@ -31,6 +31,7 @@ import type {
 	Observation,
 	Observer,
 	Page,
+	Report,
 	ReportInfo,
 	Storage,
 	SubmissionId,
@@ -73,7 +74,7 @@ import type {
 	Wake,
 } from "./types.ts";
 import { addUsageState, UsageDoc, type UsageState } from "./usage.ts";
-import { scanAll } from "./util.ts";
+import { conversationEntries, scanAll } from "./util.ts";
 import { type ConversationView, ConversationViews, type ConversationWindow } from "./view.ts";
 
 const SCAN_PAGE_SIZE = 256;
@@ -122,8 +123,12 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		return this.#host.harness.commitWith((tx) => configure(tx, this.id, change), context);
 	}
 
-	submit(submission: SubmissionDraft, context: Context): Promise<Submission> {
-		return this.#host.submissions.submit(this.id, submission, context);
+	submit(submission: SubmissionDraft, context: Context): Promise<Submission>;
+	submit(tx: Tx, submission: SubmissionDraft): Promise<SubmissionId>;
+	submit(first: SubmissionDraft | Tx, second: Context | SubmissionDraft): Promise<Submission | SubmissionId> {
+		// The overloads pair a draft with a context, and anything else (a transaction) with a draft.
+		if ("type" in first) return this.#host.submissions.submit(this.id, first, second as Context);
+		return this.#host.submissions.admit(first, this.id, second as SubmissionDraft);
 	}
 
 	async compact(instructions: string | undefined, context: Context): Promise<TaskId<CompactionResult>> {
@@ -155,13 +160,8 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		cursor: Cursor | undefined,
 		context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
-		const bounded: EntryQuery = {
-			conversationId: this.id,
-			...(query.minEntryId === undefined ? {} : { minEntryId: query.minEntryId }),
-			...(query.maxEntryId === undefined ? {} : { maxEntryId: query.maxEntryId }),
-			...(query.order === undefined ? {} : { order: query.order }),
-		};
-		return this.#host.harness.readOnLine(() => this.#host.storage.scanEntries(bounded, limit, cursor, context));
+		const scan = conversationEntries(this.id, query);
+		return this.#host.harness.readOnLine(() => this.#host.storage.scanEntries(scan, limit, cursor, context));
 	}
 
 	fork(at: EntryId, options: ConversationCreateOptions, context: Context): Promise<Conversation> {
@@ -242,7 +242,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 			env: (id, callContext) => this.buildEnv(id, callContext),
 			now,
 			onWake: options.onWake,
-			timers: hostTimers(options.setTimer, (error) => report(error, { type: "host_error", callback: "setTimer" })),
+			timers: hostTimers(options.setTimer, (error) => report(error, { kind: "host_error", callback: "setTimer" })),
 			writeAtClose: (writes) => this.writeAtClose(writes),
 			report: this.#report,
 			limitsRestarts: (kind) => LIMITS_RESTARTS.has(kind),
@@ -280,7 +280,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		const registry = snapshot ?? this.#options.registry.snapshot();
 		const state = await this.snapshot(AgentDoc, id, context);
 		return resolveAgent(state, registry, resolveSettings(this.#hostSettings()), (error, extension) =>
-			this.#report(error, { type: "extension_error", conversationId: id, extension }, context),
+			this.#report(error, { kind: "extension_error", conversationId: id, extension }, context),
 		);
 	}
 
@@ -403,7 +403,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		return this.#create({ kind: "independent", ownership: options.ownership }, options, context);
 	}
 
-	override report(error: unknown, info: ReportInfo = { type: "listener_error" }, context?: Context): void {
+	override report(error: unknown, info: ReportInfo = { kind: "listener_error" }, context?: Context): void {
 		this.#report(error, info, context);
 	}
 
@@ -451,21 +451,23 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
  * `adopt`: a throwing `onReport` is dropped, and so is a throwing metric or event, as reporting it would report again.
  */
 function safeReport(
-	onReport: ((error: unknown, info: ReportInfo) => void) | undefined,
+	onReport: ((report: Report) => void) | undefined,
 	telemetry: TelemetryContext,
 ): (error: unknown, info: ReportInfo, context?: Context) => void {
 	const reports = createTypedMetrics(telemetry.metrics ?? NOOP_TELEMETRY_METRICS, [DURABLE_TELEMETRY_SCHEMA]).counter(
 		"pi.durable.reports",
 	);
 	return (error, info, context) => {
-		contained(
-			() => onReport?.(error, info),
-			() => {},
-		);
+		if (onReport !== undefined) {
+			contained(
+				() => onReport({ ...info, error }),
+				() => {},
+			);
+		}
 		const attributes: SpanAttributes = {
-			type: info.type,
+			type: info.kind,
 		};
-		switch (info.type) {
+		switch (info.kind) {
 			case "task_faulted":
 			case "task_interrupted":
 			case "task_outdated":
@@ -484,7 +486,7 @@ function safeReport(
 				break;
 		}
 		try {
-			reports.add(1, { type: info.type });
+			reports.add(1, { type: info.kind });
 			context?.telemetry.addEvent("pi.durable.report", attributes);
 		} catch {
 			// Dropped: see above.
@@ -509,7 +511,7 @@ export function safeNow(
 			// Set first: a report handler that reads the clock again must not report again.
 			if (!reported) {
 				reported = true;
-				report(error, { type: "host_error", callback: "now" });
+				report(error, { kind: "host_error", callback: "now" });
 			}
 			return Date.now();
 		}
@@ -533,18 +535,30 @@ function boundConversation(
 			return operation(bind(context));
 		};
 	};
+	function submit(draft: SubmissionDraft, context: Context): Promise<Submission>;
+	function submit(tx: Tx, draft: SubmissionDraft): Promise<SubmissionId>;
+	async function submit(
+		first: SubmissionDraft | Tx,
+		second: Context | SubmissionDraft,
+	): Promise<Submission | SubmissionId> {
+		binding.check();
+		// The overloads pair a draft with a context, and anything else (a transaction) with a draft.
+		if (!("type" in first)) {
+			// The caller's commit carries its own context, so the invocation's abort is checked here.
+			binding.signal.throwIfAborted();
+			return submissions.admit(first, id, second as SubmissionDraft);
+		}
+		const submission = await submissions.submit(id, first, bind(second as Context));
+		return {
+			id: submission.id,
+			status: bound((callContext) => submission.status(callContext)),
+			wait: bound((callContext) => submission.wait(callContext)),
+			abort: bound((callContext) => submission.abort(callContext)),
+		};
+	}
 	return {
 		id,
-		submit: async (draft, context) => {
-			binding.check();
-			const submission = await submissions.submit(id, draft, bind(context));
-			return {
-				id: submission.id,
-				status: bound((callContext) => submission.status(callContext)),
-				wait: bound((callContext) => submission.wait(callContext)),
-				abort: bound((callContext) => submission.abort(callContext)),
-			};
-		},
+		submit,
 		abort: async (context, options) => {
 			binding.check();
 			return tasks.abortConversation(id, options?.background === true, bind(context));

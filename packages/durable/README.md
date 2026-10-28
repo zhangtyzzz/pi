@@ -81,10 +81,10 @@ Every async call takes a Chord `Context`, which carries cancellation and its cur
 
 `HarnessOptions.telemetry` accepts a host-owned `TelemetryContext` from `@earendil-works/pi-telemetry`, with optional `propagation` and `metrics` capabilities; omitted, it is a no-op. `DURABLE_TELEMETRY_SCHEMA`, exported from the package root, documents its typed spans, events, and metrics. Attributes contain IDs and control metadata, never messages, arguments, or results; IDs point to the transcript.
 
-- `pi.durable.submit` covers the public submit call and its commit. Each input starts a new root trace with a link to its caller's current span; a write is a child of its caller. Duplicate `requestId` preserves the original submission and carrier. Internal admissions, such as compaction writes, emit events on their phase span without a submit span.
+- `pi.durable.submit` covers the public submit call and its commit; for `submit(tx, draft)` it covers the admission only, its `result` is provisional until your commit is stored, and the commit's events go to your commit's context. Each input starts a new root trace with a link to its caller's current span; a write is a child of its caller. Duplicate `requestId` preserves the original submission and carrier. Internal admissions, such as compaction writes, emit events on their phase span without a submit span.
 - `pi.durable.phase` covers one run or abort phase of every task, including its decision commit, never the next phase, a durable wait, or a restart. Its attributes identify the task, phase, attempt when present, `resumed`, and outcome. Tool phases also identify the tool and call. Nested tasks and background compactions inherit the creating phase; model requests receive that phase context. Hooks add no spans.
 - Failed phase outcomes set error status with a fixed category (`task_faulted`, `task_failed`, or `task_orphaned`) and the outcome's diagnostic message, truncated to 500 characters (the reason for an orphaned task). Diagnostics can contain caller content; no error detail or exception name is recorded. An `aborted` outcome keeps status `ok`, including interruption by close or cancellation.
-- Every `onReport` report also emits a `pi.durable.report` event on its current span. Without a span, the NOOP span drops the event; no root report span is created. Only `type`, optional fixed `reason`, `extension`, and `task.id` are recorded; no error payload is included. `pi.durable.reports` counts all reports by `type` only, including those without a span. Clock failures report without a phase context. The `onReport` callback is unchanged.
+- Every `onReport` report also emits a `pi.durable.report` event on its current span. Without a span, the NOOP span drops the event; no root report span is created. Only `type` (the report's `kind`), optional fixed `reason`, `extension`, and `task.id` are recorded; no error payload is included. `pi.durable.reports` counts all reports by `type` only, including those without a span. Clock failures report without a phase context. The `onReport` callback is unchanged.
 - Committed entries and settled submissions emit `pi.durable.entry` and `pi.durable.submission`. Committed running phase changes emit `pi.durable.checkpoint`; a nested call answered from its stored result emits `pi.durable.replay`.
 - Propagation stores optional opaque `trace` carriers in submission and task JSON without a storage migration. Phase spans extract their task's stored carrier, or start at the adapter root when absent or unknown. `TaskOptions.trace` inherits the creator's carrier when absent, accepts an explicit carrier override, or uses `"root"` to start at the adapter root without storing a carrier. A run started for several queued inputs takes the first input's trace; its first invocation's phase spans link to the other inputs through immutable task `links`. A steer stays in the running trace and its submit span links to that run's stored carrier. A reopened task's first invocation has `resumed: true` in the same trace.
 - Metrics record `pi.durable.phase.duration` (milliseconds; task, phase, outcome) and `pi.durable.tasks.active` (live tasks; task name), without record IDs. Closing the Harness releases its active counts.
@@ -215,9 +215,9 @@ The default `setTimer` declines the timers that only free memory in Workers, so 
 
 **Crash loops.** Work that deterministically crashes its process, by exhausting memory or CPU before its next checkpoint, would otherwise be resumed and crash again forever. A model request the host died during is a failed attempt under `settings.retry`: its partial answer is kept as an aborted entry, the next attempt waits for the backoff (shown in `docs["pi.live"].generation.retry`), and with no retry left the run ends with `docs["pi.live"].runFailure` reason `interrupted`. A deferred response that was being fetched is polled again as the next attempt, not requested again, and cancelled when the run ends. A close is not a crash: a request it stopped is sent again. Other work is counted: open counts each task a crash, eviction, or reset cut off, and a new state the task commits starts the count over. Once the count reaches `settings.restartLimit` (default 5; `Infinity` never ends a task for it), the task ends instead of running again: a tool call with an error result (diagnostic code `restart_limit`), a compaction failed into `compactionFailure`, a run with `runFailure` reason `restart_limit` (also when charging an interrupted request keeps crashing), and a task of your own kinds `faulted`, reported as `task_faulted` with reason `restart_limit`. The built-in ones are reported as `task_interrupted`, as is a run that ends `interrupted`, so a crash loop always reaches `onReport`. Every task running when a process dies is counted, not only the one that killed it. An abort handler cut off that many times ends its task `faulted` too; a run someone aborted still ends `aborted`, with the cut-off in `detail`.
 
-**Reports.** `onReport(error, info)` says what happened in `info.type`: `session_failed` for the error that failed the Harness (a Storage error, often a platform reset); `task_faulted`, `task_interrupted` (crashes ended it, with `info.reason` and `info.restarts`), `migration_failed`, `task_outdated`, or `task_error` for a task, with `info.task` (its `id`, `kind`, and `conversationId`) and the extension that installed it in `info.extension`; `extension_error` for hooks, sections, wrappers, and tools, with the extension's name; `host_error` for a host callback, named in `info.callback`; and `listener_error`. A host can feed `task_faulted` reports of one kind to its own breaker.
+**Reports.** `onReport(report)` gets one `Report`: the `error` and what happened in `report.kind`: `storage_failed` for the error that failed the Harness (a Storage error, often a platform reset); `task_faulted`, `task_interrupted` (crashes ended it, with `report.reason` and `report.restarts`), `migration_failed`, `task_outdated` (`reason` `missing_task`, `task_too_old`, or `migration_failed`, the words a blocked task shows), or `task_error` for a task, with `report.task` (its `id`, `kind`, and `conversationId`) and the extension that installed it in `report.extension`; `extension_error` for hooks, sections, wrappers, and tools, with the extension's name; `host_error` for a host callback, named in `report.callback`; and `listener_error`. A host can feed `task_faulted` reports of one kind to its own breaker.
 
-**Queued inputs after a failed run.** A run that fails with a model error, a missing model, or crashes (`interrupted`, `restart_limit`) leaves the inputs queued behind it waiting until the next input arrives. `settings.afterFailedRun` changes that: `continue` starts the next run with them, as after an answer, and `withdraw` settles them `unanswered` with reason `run_failed`.
+**Queued inputs after a failed run.** A run that fails with a model error, a missing model, nothing to answer, its turn limit, or crashes (`interrupted`, `restart_limit`) leaves the inputs queued behind it waiting until the next input arrives. `settings.afterFailedRun` changes that: `continue` starts the next run with them, as after an answer, and `withdraw` settles them `unanswered` with reason `run_failed`.
 
 **Blocked tasks.** Tasks blocked on a missing or unmigratable definition show their reason in the task graph too, and a registry change that unblocks them makes `onWake` report the Session active, so a host need not poll them.
 
@@ -292,7 +292,7 @@ const lines = defineTool({
 });
 ```
 
-A missing, undeclared, or invalid `structuredOutput` turns a nested call's result into an error result with an `invalid_structured_output` diagnostic; for a call the model made, which never sees it, it is dropped and reported through `onReport`. An error result may omit it, and programs then find its text in a `tool_error` diagnostic; error results the Harness writes itself (blocked, invalid, interrupted, aborted) carry none, and their `diagnostics` say what went wrong. An `afterTool` hook that redacts a schema tool's `output` must redact its `structuredOutput` too. The built-in `bash` returns `{ output, truncated, fullOutputPath?, exitCode }`, where `output` is the retained tail the model sees, read with `api.retainedOutput()`, and answers a nonzero exit with an error result that still carries it.
+A missing, undeclared, or invalid `structuredOutput` turns a nested call's result into an error result with an `invalid_structured_output` diagnostic; for a call the model made, which never sees it, it is dropped and reported through `onReport`. An error result may omit it, and programs then find its text in a `tool_error` diagnostic; error results the Harness writes itself (blocked, invalid, interrupted, aborted) carry none, even when an `afterTool` hook returns one, and their `diagnostics` say what went wrong; one a hook turns into a success gives a schema-less tool's program its output. An `afterTool` hook that redacts a schema tool's `output` must redact its `structuredOutput` too. The built-in `bash` returns `{ output, truncated, fullOutputPath?, exitCode }`, where `output` is the retained tail the model sees, read with `api.retainedOutput()`, and answers a nonzero exit with an error result that still carries it.
 
 A later extension's tool with the same name replaces an earlier one where both are selected, and `wrapTool()` decorates whichever tool won:
 
@@ -391,6 +391,7 @@ await root.configure(
 		modelTools: [readTool], // of those, offer the model only read; tools may still call bash
 		instructions: "Only read; never edit files.",
 		cwd: "/work/repo",
+		maxTurns: 50, // tool rounds one run takes at most; unset: no limit
 	},
 	context,
 );
@@ -399,6 +400,8 @@ const agent = await root.agent(context); // resolved: model, extensions, tools, 
 ```
 
 Extensions and tools are passed as objects and stored by name, so a stored name outlives its code: after an extension is uninstalled, conversations that select it just stop getting it until it is installed again. `createConversation()`, `fork()`, and `root()` take the same change as `agent`. A task-owned conversation, such as a subagent's, starts as a copy of its owner's conversation's agent. A fork starts with the agent its parent had at the fork entry. The model, prompt, and offered tools of a request are fixed when it is prepared; a change applies from the next request. Tool calls and hooks use the agent as their task phase resolves it, and the environment is built from the current `cwd` at each use, so a `cwd` or extension change can reach calls the model already made.
+
+**Turn limits.** `maxTurns` bounds the tool rounds one run takes: the round that reaches it still runs its tools, then the run ends `unanswered` with `turn_limit`, like a failed run (`runFailure`, and `settings.afterFailedRun` decides the inputs queued behind it). An answer always ends the run, so it is never cut off. The count is `docs["pi.live"].run.turns`; it survives restarts, and every run starts at 0, also one a continue starts (see [Busy Conversations](#busy-conversations)), so a host or tool that continues automatically gets a fresh budget each time and must bound that itself. An `onYield` continuation also starts the count over: an extension that keeps a run going bounds its own loop, reading `pi.live.run.turns` and `pi.agent.maxTurns` with `api.snapshot`. `configure()` throws a `RangeError` for anything but an integer 1 or more (or `null`); a change applies at the end of the current round, and children and forks inherit it like the rest of the agent.
 
 ## Settings
 
@@ -478,7 +481,9 @@ Everything a UI needs is committed state. `watch()` returns a watch of the conve
 ```typescript
 const watch = await root.watch(context);
 render(watch.value); // the state at attachment
-watch.start(async ({ value, ops }) => {
+watch.start(async (call) => {
+	if (call.kind !== "value") return; // Durable's watches end on a failure; they never send a failed call
+	const { value, ops } = call;
 	// value.entries: a window over the transcript, newest last; value.before: the entry just before it
 	// value.docs["pi.live"]: the run, the running generation (streamed partial, retry, deferred), tool calls (output,
 	//   details), compactions, and why the last run ended without an answer (runFailure)
@@ -499,7 +504,9 @@ import { ConversationTranscript } from "@earendil-works/pi-durable";
 const transcript = new ConversationTranscript((query, limit, ctx) => root.entries(query, limit, undefined, ctx));
 const watch = await root.watch(context);
 render(transcript.merge(watch.value));
-watch.start(async ({ value }) => render(transcript.merge(value)));
+watch.start(async (call) => {
+	if (call.kind === "value") render(transcript.merge(call.value));
+});
 
 // When a marker scrolls into view:
 render(await transcript.loadEarlier(context)); // the page before the oldest entry
@@ -511,9 +518,9 @@ const resumed = await root.watch(context, transcript.resume);
 
 Entries never change once committed, so a merge only adds; one that adds nothing returns the same `items` array. See `test/examples/31-transcript.ts`.
 
-Watches are Chord's `WatchHandle` (exported by `@earendil-works/chord`; Durable re-exports it). The listener gets one change per call, `{ value, ops, retired }`, and the newest commit's context. A watch ends once, and `closed` (or `stop()`) gives the reason: `stopped`, `cancelled` (its acquisition context was cancelled), `ended` (the Harness closed, or a task document's task ended), `listener_error`, or `failed` (the Harness failed). An ended watch keeps its last value and no longer references the Harness.
+Watches are Chord's `WatchHandle` (exported by `@earendil-works/chord`; Durable re-exports it). The listener gets one `WatchCall` per call, tagged by `kind`, and the newest commit's context: `{ kind: "value", value, ops, retired }`. Chord's watches also have `{ kind: "failed", error }` calls for failures a source recovers from; Durable's failures are final, so a Durable watch never sends one and ends instead. A watch ends once, and `closed` (or `stop()`) gives a `WatchEnd` tagged by `kind`: `stopped`, `aborted` (its acquisition context was aborted), `ended` (the Harness closed, or a task document's task ended), `listener_error`, or `failed` (the Harness failed). An ended watch keeps its last value and no longer references the Harness.
 
-Adapters that must change in the same step as Durable's memory, such as a Chord source over a view, attach a synchronous observer instead of a watch: `harness.observeConversation(id, observer, context)`, `harness.observeTaskGraph(observer, context)`, and `harness.observeDoc(token, ...scope, observer, context)` return the current `value` and `detach()`, and call `observer.advance(change, context)` with every later change, unfolded, as memory adopts it: inside the storage's commit for a stored commit, at once for a deferred one (before it is stored). A document observer gets one call per change at its address, so a commit that retires and recreates the document gives two; the task graph also advances without a commit when a registry change alters a task's `blocked` reason. A change can arrive before the `observeXXX()` promise resolves; its ops apply from the observation's `value`. `observer.end(failure)` comes once, when the Harness closes or fails, or, for a task document, right after the retirement of the commit that ends its task. `advance` only records the change: no awaits, no Harness calls, no throws, and quick, since every commit waits for it. One that throws is reported, detached, and ended with the error. Watches are built on these observers.
+Adapters that must change in the same step as Durable's memory, such as a Chord source over a view, attach a synchronous observer instead of a watch: `harness.observeConversation(id, observer, context)`, `harness.observeTaskGraph(observer, context)`, and `harness.observeDoc(token, ...scope, observer, context)` return the current `value` and `detach()`, and call `observer.advance(call, context)` with every later change as a `WatchCall` (always a `value` call), unfolded, as memory adopts it: inside the storage's commit for a stored commit, at once for a deferred one (before it is stored). A document observer gets one call per change at its address, so a commit that retires and recreates the document gives two; the task graph also advances without a commit when a registry change alters a task's `blocked` reason. A change can arrive before the `observeXXX()` promise resolves; its ops apply from the observation's `value`. `observer.end(end)` comes once with a `WatchEnd`: `ended` when the Harness closes or, for a task document, right after the retirement of the commit that ends its task, `failed` when the Harness fails. `advance` only records the change: no awaits, no Harness calls, no throws, and quick, since every commit waits for it. One that throws (or returns a rejected promise) is reported, detached, and ended `listener_error`. Watches are built on these observers.
 
 Commits that land while a callback runs are delivered together in the next callback: the newest view and the operations of all of them, folded (appends to one string join, sets of one field keep the last). Past 10,000 pending operations the callback gets one root replacement `[["r", view]]` holding the whole newest view instead, its window included. A client that joins late or reconnects starts from the current view; nothing is replayed.
 
@@ -527,18 +534,45 @@ A conversation is busy while a run is working on an input. Submitting to a busy 
 await root.submit({ type: "input", content: "Also run the tests" }, context); // follow-up (default)
 await root.submit({ type: "input", content: "Use pnpm, not npm", whenBusy: "steer" }, context);
 await root.submit({ type: "input", content: "Only if idle", whenBusy: "reject" }, context); // throws ConversationBusy
+await root.submit({ type: "input", content: "Only if busy", whenBusy: "steer", whenIdle: "reject" }, context); // throws ConversationIdle when idle
 await root.submit({ type: "write", entry: { kind: "app.note", data: "user opened a file" } }, context);
 ```
 
 - **Steers** are placed after the current tool round and join the running work.
 - **Follow-ups** are placed when the run answers, and start the next run.
+- **`whenIdle: "reject"`** refuses an input when no run is working, so it never starts a run of its own. With `whenBusy: "steer"`, it steers the current run or throws `ConversationIdle`. A run that answered and waits for its [after-run tasks](#work-at-the-end-of-a-run) is still working, so such an input queues and starts the next run.
+- **`submit(tx, draft)`** admits inside your own commit, with the same rules, and returns the submission's ID. Your checks, the admission, and your writes are stored together or not at all:
+
+  ```typescript
+  const id = await harness.commit(async (tx) => {
+    const chat = await tx.doc(MyChat, root.id); // your own conversation document
+    if (chat.muted.includes(userId)) throw new Error("Muted");
+    const id = await root.submit(tx, { type: "input", content: text, whenBusy: "steer", whenIdle: "reject" });
+    chat.sent.push({ id, userId }); // your own state, same commit
+    return id;
+  }, context);
+  ```
+
+  Call it before the commit's own table writes (`appendEntry()`, `createTask()`, another admission), once per commit: otherwise it throws `ReadAfterWrite`, on every path. Documents may be read and written before and after it. A rejection (`ConversationBusy`, `ConversationIdle`) throws before any write, so you may catch it. Until your commit is stored the admission is provisional: if your callback throws later, no submission exists. Tasks and tools do the same in their own commits through `api.conversation(id)`; entries the admission places carry the task's `byTaskId`.
 - **Writes** append an entry without asking the model anything. A write of only `kind` and `data` changes nothing the model sees, so it is appended at once, even mid-run, and is never queued: a chat message shows in the transcript as soon as it is sent. It can therefore appear before items submitted earlier that are still queued, except behind a queued reset, where it waits so the reset does not hide it. A write with `model`, `head`, or `edits` waits for the next boundary like a steer.
 - `await submission.abort(context)` withdraws a queued submission.
 - The [settings](#settings) `steeringMode: "all"` and `followUpMode: "all"` place every queued item at once instead of one per turn.
 
-If a run fails, queued items stay in the inbox until the next input or queued write places them, oldest first.
+If a run fails, queued items stay in the inbox until the next input, queued write, or continue places them, oldest first.
 
-When a run ends without an answer, `docs["pi.live"].runFailure` says why until the next run starts: `model_error` and `no_model` (with the error text or the missing model in `detail`), `aborted`, `reset`, `interrupted` (the host stopped while the model answered, with no retry left), or `faulted`, `orphaned`, and `restart_limit` (the run's task could not go on). The run's inputs are in it too, settled `unanswered`; the settlement's reason is the same, except that an orphaned run's inputs carry why it was orphaned (`missing_task`, `task_too_old`, `migration_failed`) and `no_model` has no `detail` there (spec §8.2).
+When a run ends without an answer, `docs["pi.live"].runFailure` says why until the next run starts: `model_error` and `no_model` (with the error text or the missing model in `detail`), `aborted`, `reset`, `interrupted` (the host stopped while the model answered, with no retry left), `faulted`, `orphaned`, and `restart_limit` (the run's task could not go on), `turn_limit` (a tool round reached the conversation's `maxTurns`), or `nothing_to_answer` (a continue, below, found nothing to answer). The run's inputs are in it too, settled `unanswered`; the settlement's reason is the same, except that an orphaned run's inputs carry why it was orphaned (`missing_task`, `task_too_old`, `migration_failed`) and `no_model` has no `detail` there (spec §8.2).
+
+To resume such a run without typing a message, submit a continue. It starts a run on the context as it is, so the model answers the user message or tool results the stopped run left:
+
+```typescript
+const live = await harness.snapshot(LiveDoc, root.id, context);
+if (live?.run === undefined && live?.runFailure !== undefined) {
+	const resumed = await root.submit({ type: "continue" }, context); // throws ConversationBusy while busy
+	await resumed.wait(context); // done with the answer, or unanswered like any run
+}
+```
+
+A continue is never queued: it throws `ConversationBusy` while a run is working, since whether there is anything to continue depends on how that run ends. Items a failed run left queued are placed first and join the run. A context with nothing to answer (empty, or ending in an answer, also a text answer cut off at its output limit) ends the run without a request, `unanswered` with `nothing_to_answer`. A cut-off answer with tool calls can be continued: its calls never ran, so the context ends in their error results. Tools can continue the conversations they own through `api.conversation(id)`, as they submit to them.
 
 An input is placed as a `pi.user` entry. To show it as something else, give it an `entry` with your kind and data; the model still sees `content` as the user message:
 
@@ -607,7 +641,7 @@ When a provider rejects a request because the context is too long, generation co
 
 When a compaction that a generation waits for at the blocking threshold fails, the generation fails too, without sending a request: its inputs settle `unanswered` with `model_error` and detail `Compaction failed: <error>`. One that finds nothing to compact or is declined lets the request go ahead.
 
-Running compactions are listed in `docs["pi.live"].compactions` with their reason, attempt, and retry backoff. The newest failure stays in `docs["pi.live"].compactionFailure` (task, reason, error) until a compaction produces a summary.
+Running compactions are listed in `docs["pi.live"].compactions` with their `trigger` (`manual`, `threshold`, or `overflow`), attempt, and retry backoff. The newest failure stays in `docs["pi.live"].compactionFailure` (task, trigger, error) until a compaction produces a summary.
 
 ## Hooks
 
@@ -625,10 +659,46 @@ const Guard = defineExtension({
 });
 ```
 
-- **Generation:** `beforeRequest` (replace the messages of one request), `afterResponse`, `onYield` (continue the run with another user message), and `afterTools` (runs once a round's tools are done).
-- **Tools:** `beforeTool` (block or rewrite arguments) and `afterTool` (replace the result).
+- **Generation:** `beforeRequest` (replace the messages of one request), `afterResponse`, `onYield` (continue the run with another user message), `afterTools` (runs once a round's tools are done), and `afterRun` (tasks to run before the run ends, below).
+- **Tools:** `beforeTool` (block or rewrite arguments) and `afterTool` (replace the result). `afterTool` sees every result a tool task writes, also the error results the Harness writes itself (unavailable, invalid, blocked, interrupted, restart limit, aborted), told apart by their diagnostic code; past `settings.restartLimit` it no longer runs. On an abort it runs inside the abort handler, so a slow hook delays `abort()`.
 
 To limit a hook to some conversations, select its extension only there, for example with `configure({ extensions: { add: [Guard] } })`.
+
+Hooks read committed documents (`api.snapshot()`) and the conversation's raw history (`api.entry()`, `api.entries()`), which compaction never changes.
+
+### Work at the end of a run
+
+An `afterRun` hook starts durable work after a run answered, without a tool call: for example the project's tests after a run that edited files. It returns tasks, built with `runEndTask()`, and the generation creates them as its children and waits for them before the run ends:
+
+```typescript
+import { defineExtension, GenerationTask, hook, runEndTask, ToolResultEntry } from "@earendil-works/pi-durable";
+
+const TestsAfterEdits = defineExtension({
+	name: "tests-after-edits",
+	tasks: [RunTests], // a task of yours, defineTask(): runs the tests, then commits its result
+	hooks: [
+		hook(GenerationTask, {
+			afterRun: async (run, api, context) => {
+				// The run's own entries, also those a compaction summarized.
+				const range = { minEntryId: run.first, maxEntryId: run.last, order: "ascending" } as const;
+				const { items } = await api.entries(range, 1000, undefined, context); // page with `next` for longer runs
+				const edited = items.some((entry) => {
+					const message = entry.model?.[0];
+					return ToolResultEntry.is(entry) && message?.role === "toolResult" && message.toolName === "edit";
+				});
+				return edited ? { tasks: [runEndTask(RunTests, { command: "npm test" })] } : undefined;
+			},
+		}),
+	],
+});
+```
+
+- **When:** after a final answer or a `terminate` round, not while an `onYield` continuation keeps the run going, never after a failure or an abort.
+- **The answer first:** the answer is committed and the run's inputs settle `done` before the hooks are asked, so `Submission.wait()` resolves at the answer.
+- **Busy until done:** `pi.live.run` stays, with `run.afterRun` listing the tasks, so the conversation is busy and `waitForIdle()` includes them; Stop aborts them; a crash resumes them. A crash before they exist asks the hooks again, never twice once they do.
+- **Input meanwhile:** steers and follow-ups queue and start the next run once the tasks are done; `whenBusy: "reject"` and a continue throw `ConversationBusy`.
+- **Results for the model:** a task gets its conversation's handle before its commit, `const handle = (await runtime.conversation(runtime.conversationId, context))!`, and admits a write or a follow-up (say "the tests failed: ...") inside it with `handle.submit(tx, draft)`, before its own table writes. Both are placed when the run ends: a write before any queued user input, a follow-up in queue order with the rest. A follow-up starts a fix run, which asks `afterRun` again with a fresh turn budget, so cap such loops in your extension.
+- **Broken requests** (an uninstalled or built-in task, a non-JSON input, a throwing `initial()`) are reported through `onReport` against the hook's extension and skipped; the run still ends.
 
 ## More Conversations and Forks
 
@@ -719,8 +789,9 @@ decide: async (task, runtime, context) => {
 
 ```typescript
 const graph = await harness.watchTaskGraph(context);
-graph.start(async ({ value }) => {
-	for (const node of Object.values(value.tasks)) {
+graph.start(async (call) => {
+	if (call.kind !== "value") return;
+	for (const node of Object.values(call.value.tasks)) {
 		const status = node.state.status === "waiting" ? `waiting on ${node.state.on.join(", ")}` : node.state.status;
 		console.log(`${node.id} ${node.kind} ${status}`, node.owner ?? `conversation ${node.conversationId}`);
 	}
@@ -764,9 +835,9 @@ await root.commit(
 );
 ```
 
-Watches and the view see it at once. Storage gets it with the next commit that reads or writes the document, before the document leaves memory, at close, and at the latest about `withinMs` later; `subscribeCommits()` sees it then, with exactly what was stored (a document the commit retires shows as its retirement only). A crash loses what was not stored yet, so derive nothing durable from such a value outside a commit that reads it. Only a commit that changes nothing but existing documents with `history: "latest"` and `fork: "initial"` is deferred; anything else in it, such as an entry, a new document, or a task state, stores it at once.
+Watches and the view see it at once. Storage gets it with the next commit that reads or writes the document, before the document leaves memory, at close, and at the latest about `withinMs` later; `observeCommits()` sees it then, with exactly what was stored (a document the commit retires shows as its retirement only). A crash loses what was not stored yet, so derive nothing durable from such a value outside a commit that reads it. Only a commit that changes nothing but existing documents with `history: "latest"` and `fork: "initial"` is deferred; anything else in it, such as an entry, a new document, or a task state, stores it at once.
 
-`harness.watchDoc()` watches one document like the view above. A document watch follows its address: a retirement is a call with `retired: true`, the last value the watch was given (a change made in the retiring commit itself is not shown), and no ops, and a document created there later arrives as `[["r", value]]` on the same watch. A task document's watch ends `ended` with its task: once the retirement call of the commit that ends the task has returned, or at the Harness's close if that call was never delivered (a watch never started); an observer of it gets `end(undefined)` right after the retirement. `HarnessOptions.conversationCreated(tx, conversation)` runs in every commit that creates or forks a conversation, including a tool's raw `tx.createConversation()`, so every conversation gets your documents; `init` in `createConversation()`, `fork()`, and `root()` writes per-call data in the same commit. An extension's tools, sections, and hooks read their own documents through `api` or `input.read`, and treat an absent one as its default ([`10-extension-state.ts`](test/examples/10-extension-state.ts)).
+`harness.watchDoc()` watches one document like the view above. A document watch follows its address: a retirement is a call with `retired: true`, the last value the watch was given (a change made in the retiring commit itself is not shown), and no ops, and a document created there later arrives as `[["r", value]]` on the same watch. A task document's watch ends `ended` with its task: once the retirement call of the commit that ends the task has returned, or at the Harness's close if that call was never delivered (a watch never started); an observer of it gets `end({ kind: "ended" })` right after the retirement. `HarnessOptions.conversationCreated(tx, conversation)` runs in every commit that creates or forks a conversation, including a tool's raw `tx.createConversation()`, so every conversation gets your documents; `init` in `createConversation()`, `fork()`, and `root()` writes per-call data in the same commit. An extension's tools, sections, and hooks read their own documents through `api` or `input.read`, and treat an absent one as its default ([`10-extension-state.ts`](test/examples/10-extension-state.ts)).
 
 ## Usage and Cost
 
@@ -848,7 +919,7 @@ Three rules decide what an error does:
 
 ```typescript
 harness.closed.then((end) => {
-	if (end.reason === "failed") reopen(end.error);
+	if (end.kind === "failed") reopen(end.error);
 });
 ```
 
@@ -882,6 +953,11 @@ node --conditions=source --experimental-strip-types test/examples/13-chat.ts
 | [29-tool-override](test/examples/29-tool-override.ts) | A same-name bash for some conversations, and a wrapper that times whichever bash won |
 | [30-reload-and-restart](test/examples/30-reload-and-restart.ts) | Reloading an extension mid-call, and stored choices surviving a restart |
 | [31-transcript](test/examples/31-transcript.ts) | A client's transcript over the windowed view: live appends, a stall with a gap, loading it and earlier pages, and resuming with `from` |
+| [32-tests-after-edits](test/examples/32-tests-after-edits.ts) | An `afterRun` hook that runs the tests after every run that edited files, a fix run when they fail, and input waiting for them |
+| [33-turn-limit-and-continue](test/examples/33-turn-limit-and-continue.ts) | A per-conversation turn limit, `runFailure`, and continuing without a user message |
+| [34-submit-in-commit](test/examples/34-submit-in-commit.ts) | Admitting a visitor's steer inside the host's own commit with `submit(tx, draft)` and `whenIdle: "reject"` |
+| [35-durable-on-the-store](test/examples/35-durable-on-the-store.ts) | A Harness on `StoreStorage` in a Chord host's store, next to a Chord object's own table: one commit queue, one id allocator, one export |
+| [36-durable-views](test/examples/36-durable-views.ts) | A Chord object following a Durable view with `self.follow`: its frames and a member reading the followed value |
 | [00](test/examples/00-conversation.ts)–[12](test/examples/12-recovery.ts) | The layers underneath: sessions, documents, forks, watches, the Harness, agent configuration, reload, extension state, tasks, recovery |
 
 Examples that call OpenAI need `OPENAI_API_KEY`; most use the faux provider otherwise.

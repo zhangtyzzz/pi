@@ -26,7 +26,7 @@ import { describe, expect, it } from "vitest";
 import { type ChatSetup, chatSetup, openChat, textOf, waitFor } from "./chat-support.ts";
 import { addTool } from "./harness-support.ts";
 import { slotsOf, viewHistory } from "./live-support.ts";
-import { context, documentChanges, observeCommits } from "./session-support.ts";
+import { context, documentValues, followCommits, onValue } from "./session-support.ts";
 import { aborted, deferred } from "./task-support.ts";
 
 type Frame = { value: ConversationView; ops: readonly Op[] };
@@ -40,13 +40,15 @@ async function listen(conversation: Conversation, check = true) {
 	const frames: Frame[] = [];
 	let replayed = watch.value;
 	let mismatches = 0;
-	watch.start(async ({ value, ops }) => {
-		if (check) {
-			replayed = applyImmutable(replayed, ops);
-			if (JSON.stringify(replayed) !== JSON.stringify(value)) mismatches++;
-		}
-		frames.push({ value, ops });
-	});
+	watch.start(
+		onValue(async ({ value, ops }) => {
+			if (check) {
+				replayed = applyImmutable(replayed, ops);
+				if (JSON.stringify(replayed) !== JSON.stringify(value)) mismatches++;
+			}
+			frames.push({ value, ops });
+		}),
+	);
 	return { watch, frames, mismatches: () => mismatches };
 }
 
@@ -63,9 +65,9 @@ function slow(): ChatSetup {
 /** Committed partials of the Harness's generations, one per commit that has one. */
 function partialsOf(harness: Harness): AssistantMessage[] {
 	const partials: AssistantMessage[] = [];
-	observeCommits(harness, (publication) => {
-		for (const change of documentChanges(publication)) {
-			const message = (change.value as LiveState | null)?.generation?.message as AssistantMessage | undefined;
+	followCommits(harness, (publication) => {
+		for (const change of documentValues(publication)) {
+			const message = (change.value as LiveState)?.generation?.message as AssistantMessage | undefined;
 			if (change.record.kind === "pi.live" && message !== undefined) partials.push(message);
 		}
 	});
@@ -101,7 +103,12 @@ describe("a run as the conversation view shows it", () => {
 		expect(partialsIn(states).map(textOf)).toEqual(partials.map(textOf));
 		// The run shows from the input's commit until the commit that appends the answer and clears the partial.
 		const started = states.findIndex((state) => state.run !== undefined);
-		expect(states[started]!.run).toEqual({ taskId: expect.any(Number), inputs: [submission.id] });
+		expect(states[started]!.run).toEqual({
+			taskId: expect.any(Number),
+			inputs: [submission.id],
+			turns: 0,
+			first: expect.any(Number),
+		});
 		expect(history.views[started]!.entries.at(-1)!.kind).toBe("pi.user");
 		const ended = states.findIndex((state, index) => index > started && state.run === undefined);
 		expect(states[ended]!.generation).toBeUndefined();
@@ -214,9 +221,10 @@ describe("a run as the conversation view shows it", () => {
 		const observation = await harness.observeConversation(
 			root.id,
 			{
-				advance: (change) => {
-					views.push(change.value);
-					ops.push([...change.ops]);
+				advance: (call) => {
+					if (call.kind !== "value") return;
+					views.push(call.value);
+					ops.push([...call.ops]);
 				},
 				end: () => {},
 			},
@@ -269,9 +277,9 @@ describe("a run as the conversation view shows it", () => {
 		]);
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const outputs: string[] = [];
-		observeCommits(harness, (publication) => {
-			for (const change of documentChanges(publication)) {
-				const output = (change.value as LiveState | null)?.tools?.[0]?.output;
+		followCommits(harness, (publication) => {
+			for (const change of documentValues(publication)) {
+				const output = (change.value as LiveState)?.tools?.[0]?.output;
 				if (change.record.kind === "pi.live" && output !== undefined && output !== outputs.at(-1)) {
 					outputs.push(output);
 				}
@@ -324,7 +332,7 @@ describe("a run as the conversation view shows it", () => {
 		await harness.close(context);
 	});
 
-	it("ends a call that never runs with its result at once, and a tool aborted with its generation", async () => {
+	it("ends a call that never runs through its own task, and a tool aborted with its generation", async () => {
 		const setup = chatSetup();
 		addTool(
 			setup.registry,
@@ -349,13 +357,14 @@ describe("a run as the conversation view shows it", () => {
 		await submission.wait(context);
 		history.detach();
 		const states = history.live();
-		// The call not offered is listed done, with its result entry, in the commit of its calling answer.
+		// #11043: the call not offered is listed pending with its task in the commit of its calling answer, and its task
+		// ends it done with its result entry.
 		const listed = slotsOf(states, "c1").findIndex((slot) => slot !== undefined);
-		const ghost = slotsOf(states, "c1")[listed]!;
-		expect(ghost.status).toBe("done");
-		const listing = history.views[listed]!.entries;
-		expect(listing.map((entry) => entry.kind).slice(-2)).toEqual(["pi.assistant", "pi.tool-result"]);
-		expect(ghost.entry).toBe(listing.at(-1)!.id);
+		expect(slotsOf(states, "c1")[listed]).toMatchObject({ status: "pending", unoffered: true });
+		expect(slotsOf(states, "c1")[listed]!.taskId).toBeDefined();
+		expect(history.views[listed]!.entries.at(-1)!.kind).toBe("pi.assistant");
+		const ended = slotsOf(states, "c1").findIndex((slot) => slot?.status === "done");
+		expect(slotsOf(states, "c1")[ended]!.entry).toBe(history.views[ended]!.entries.at(-1)!.id);
 		// The aborted tool ends with its result entry, then the run ends without an answer.
 		const done = slotsOf(states, "c2").findIndex((slot) => slot?.status === "done");
 		expect(slotsOf(states, "c2")[done]!.entry).toBe(history.views[done]!.entries.at(-1)!.id);
@@ -441,9 +450,11 @@ describe("a run as the conversation view shows it", () => {
 			await root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), context);
 		}
 		const frames: Frame[] = [];
-		watch.start(async ({ value, ops }) => {
-			frames.push({ value, ops });
-		});
+		watch.start(
+			onValue(async ({ value, ops }) => {
+				frames.push({ value, ops });
+			}),
+		);
 		await drained();
 		expect(frames[0]!.ops).toEqual([["r", frames[0]!.value]]);
 		await change((live) => {
@@ -503,7 +514,7 @@ describe("streamed partials", () => {
 		const ops: Op[] = [];
 		const observation = await harness.observeConversation(
 			root.id,
-			{ advance: (change) => ops.push(...change.ops), end: () => {} },
+			{ advance: (call) => call.kind === "value" && ops.push(...call.ops), end: () => {} },
 			context,
 		);
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
@@ -552,7 +563,7 @@ describe("streamed partials", () => {
 			]);
 			const { harness, root } = await openChat(new MemoryStorage(), setup);
 			let commits = 0;
-			observeCommits(harness, () => commits++);
+			followCommits(harness, () => commits++);
 			const bytes = await allocatedBytes(async () => {
 				await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
 			});

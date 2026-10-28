@@ -18,14 +18,18 @@ import {
 	CompactionTask,
 	type ContextView,
 	type Conversation,
+	createSession,
+	defineDoc,
 	defineTask,
 	defineTool,
 	type EntryRecord,
 	type Harness,
+	type JsonObject,
 	LiveDoc,
 	type LiveState,
 	MemoryStorage,
 	ProviderDoc,
+	type SubmissionId,
 	type TaskId,
 	UsageDoc,
 } from "@earendil-works/pi-durable";
@@ -962,7 +966,7 @@ describe("background threshold compaction", () => {
 		expect(task).toMatchObject({ background: true, input: { reason: "threshold" } });
 		expect(task!.owner).toBeUndefined();
 		expect((await live(chat)).compactions).toEqual([
-			{ taskId: task!.id, reason: "threshold", blocking: false, attempt: 1 },
+			{ taskId: task!.id, trigger: "threshold", blocking: false, attempt: 1 },
 		]);
 		// Background work: neither conversation idle nor Esc waits for or stops it.
 		await chat.root.waitForIdle(context);
@@ -1015,7 +1019,7 @@ describe("background threshold compaction", () => {
 		await turn(chat, text("u4", 100), text("a4", 100));
 		await waitFor(async () => (await live(chat)).compactionFailure !== undefined);
 		const recorded = (await live(chat)).compactionFailure;
-		expect(recorded).toMatchObject({ reason: "threshold", error: "Summarization failed: bad request" });
+		expect(recorded).toMatchObject({ trigger: "threshold", error: "Summarization failed: bad request" });
 		// The value that drops the compaction's status records its failure.
 		const ended = (taskId: TaskId) => {
 			const states = views.live();
@@ -1081,7 +1085,7 @@ describe("blocking threshold compaction", () => {
 			checkpoint: { phase: "prepare", attempt: 1, compacted: child!.id },
 		});
 		expect((await live(chat)).compactions).toEqual([
-			{ taskId: child!.id, reason: "threshold", blocking: true, attempt: 1 },
+			{ taskId: child!.id, trigger: "threshold", blocking: true, attempt: 1 },
 		]);
 		// Nothing was appended before the wait.
 		expect((await kinds(chat.root)).at(-1)).toBe("pi.user");
@@ -1141,7 +1145,7 @@ describe("blocking threshold compaction", () => {
 		const state = await live(chat);
 		expect(state.compactions).toBeUndefined();
 		expect(state.compactionFailure).toMatchObject({
-			reason: "threshold",
+			trigger: "threshold",
 			error: "Summarization failed: bad request",
 		});
 		await chat.harness.close(context);
@@ -1578,7 +1582,7 @@ describe("compaction live status", () => {
 		expect((late.value.docs["pi.live"] as LiveState).compactions).toEqual([
 			{
 				taskId: id,
-				reason: "manual",
+				trigger: "manual",
 				blocking: false,
 				attempt: 1,
 				retry: { at: expect.any(Number), error: "overloaded" },
@@ -1589,7 +1593,7 @@ describe("compaction live status", () => {
 		await waitFor(async () => (await live(chat)).compactions === undefined);
 		views.detach();
 		const listed = views.live().flatMap((state) => state.compactions ?? []);
-		expect(listed[0]).toEqual({ taskId: id, reason: "manual", blocking: false, attempt: 1 });
+		expect(listed[0]).toEqual({ taskId: id, trigger: "manual", blocking: false, attempt: 1 });
 		// An abort is not a failure.
 		expect(views.live().at(-1)!.compactionFailure).toBeUndefined();
 		await chat.harness.close(context);
@@ -1990,7 +1994,7 @@ describe("compaction edge cases", () => {
 		expect((await kinds(chat.root)).includes("pi.compaction")).toBe(false);
 		const state = await live(chat);
 		expect(state.compactions).toBeUndefined();
-		expect(state.compactionFailure).toMatchObject({ reason: "threshold", error: "no credentials" });
+		expect(state.compactionFailure).toMatchObject({ trigger: "threshold", error: "no credentials" });
 		await chat.harness.close(context);
 	});
 
@@ -2126,7 +2130,7 @@ describe("compaction edge cases", () => {
 			return summary();
 		});
 		const id = await chat.root.compact(undefined, context);
-		expect(await chat.harness.closed).toEqual({ reason: "failed", error: failure });
+		expect(await chat.harness.closed).toEqual({ kind: "failed", error: failure });
 		await chat.harness.close(context);
 		// Nothing of the failed commit landed: the task is still live, without usage, entry, or submission.
 		storage.reopen();
@@ -2282,7 +2286,7 @@ describe("compaction pinning, silent overflow, and late policy changes", () => {
 		await reached.promise;
 		const watch = await chat.root.watch(context);
 		expect((watch.value.docs["pi.live"] as LiveState).compactions).toEqual([
-			{ taskId: id, reason: "manual", blocking: false, attempt: 1 },
+			{ taskId: id, trigger: "manual", blocking: false, attempt: 1 },
 		]);
 		await watch.stop();
 		await chat.harness.abortTask(id, context);
@@ -2348,7 +2352,7 @@ describe("blocked compaction", () => {
 		const id = await root.commit(async (tx) => {
 			const taskId = await tx.createTask(newer, { reason: "manual" }, { ownership: { kind: "conversation" } });
 			const live = await tx.doc(LiveDoc, root.id);
-			live.compactions = [{ taskId, reason: "manual", blocking: false, attempt: 1 }];
+			live.compactions = [{ taskId, trigger: "manual", blocking: false, attempt: 1 }];
 			return taskId;
 		}, context);
 		await harness.close(context);
@@ -2366,7 +2370,7 @@ describe("blocked compaction", () => {
 			reason: "task_too_old",
 		});
 		expect((await live(chat)).compactions).toBeUndefined();
-		expect((await live(chat)).compactionFailure).toEqual({ taskId: id, reason: "manual", error: "task_too_old" });
+		expect((await live(chat)).compactionFailure).toEqual({ taskId: id, trigger: "manual", error: "task_too_old" });
 		await chat.harness.close(context);
 	});
 });
@@ -2447,5 +2451,97 @@ describe("per-model compaction overrides", () => {
 		const messages = (await chat.root.context(context)).messages;
 		expect(messages.slice(1).map(userText)).toEqual([text("u3", 100), text("a3", 100)]);
 		await chat.harness.close(context);
+	});
+});
+
+describe("pi.live migrations", () => {
+	it("reads a version 1 value with each compaction's `reason` as `trigger`, and stores it migrated on its next write", async () => {
+		const storage = new MemoryStorage();
+		const session = createSession(storage);
+		// `pi.live` as version 1 wrote it.
+		const LiveV1 = defineDoc<JsonObject>({
+			kind: "pi.live",
+			version: 1,
+			scope: "conversation",
+			history: "latest",
+			fork: "initial",
+			initial: () => ({}),
+			checkpointWhen: () => false,
+		});
+		const conversationId = await session.commit(
+			async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+			context,
+		);
+		await session.commit(async (tx) => {
+			const live = await tx.doc(LiveV1, conversationId);
+			live.run = { taskId: 9, inputs: [4] };
+			live.compactions = [{ taskId: 7, reason: "threshold", blocking: true, attempt: 2 }];
+			live.compactionFailure = { taskId: 5, reason: "manual", error: "no model" };
+		}, context);
+		// The version 2 token reloads the stored value and migrates it.
+		const stored = async () => {
+			const record = await storage.findDocument(
+				{ kind: "pi.live", scope: { kind: "conversation", conversationId } },
+				"current",
+				context,
+			);
+			return (await storage.document(record!.id, "current", context))!;
+		};
+		const migrated: LiveState = {
+			// A run in flight across the upgrade counts its turns from 0 (#11043).
+			run: { taskId: 9 as TaskId, inputs: [4 as SubmissionId], turns: 0 },
+			compactions: [{ taskId: 7 as TaskId<CompactionResult>, trigger: "threshold", blocking: true, attempt: 2 }],
+			compactionFailure: { taskId: 5 as TaskId<CompactionResult>, trigger: "manual", error: "no model" },
+		};
+		const read = await session.snapshot(LiveDoc, conversationId, context);
+		expect(read).toEqual(migrated);
+		expect(Object.keys(read!.compactions![0]!)).toEqual(["taskId", "trigger", "blocking", "attempt"]);
+		// A read migrates in memory only: Storage keeps the version 1 value.
+		expect(await stored()).toMatchObject({
+			version: 1,
+			value: { compactions: [{ reason: "threshold" }], compactionFailure: { reason: "manual" } },
+		});
+		await session.commit(async (tx) => {
+			(await tx.doc(LiveDoc, conversationId)).compactions![0]!.attempt = 3;
+		}, context);
+		expect(await stored()).toMatchObject({
+			version: 3,
+			value: { compactions: [{ trigger: "threshold", attempt: 3 }], compactionFailure: { trigger: "manual" } },
+		});
+		await session.close(context);
+	});
+
+	// #11043: an unreleased build stored version 2 without `run.turns`; a run in flight then counted NaN turns.
+	it("gives a version 2 run without turns a count of 0", async () => {
+		const storage = new MemoryStorage();
+		const session = createSession(storage);
+		const LiveV2 = defineDoc<JsonObject>({
+			kind: "pi.live",
+			version: 2,
+			scope: "conversation",
+			history: "latest",
+			fork: "initial",
+			initial: () => ({}),
+			checkpointWhen: () => false,
+		});
+		const conversationId = await session.commit(
+			async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+			context,
+		);
+		await session.commit(async (tx) => {
+			const live = await tx.doc(LiveV2, conversationId);
+			live.run = { taskId: 9, inputs: [4] };
+			live.compactions = [{ taskId: 7, trigger: "threshold", blocking: true, attempt: 2 }];
+		}, context);
+		expect(await session.snapshot(LiveDoc, conversationId, context)).toEqual({
+			run: { taskId: 9, inputs: [4], turns: 0 },
+			compactions: [{ taskId: 7, trigger: "threshold", blocking: true, attempt: 2 }],
+		});
+		// A version 2 run that has a count keeps it.
+		await session.commit(async (tx) => {
+			(await tx.doc(LiveV2, conversationId)).run = { taskId: 9, inputs: [4], turns: 3 };
+		}, context);
+		expect((await session.snapshot(LiveDoc, conversationId, context))?.run?.turns).toBe(3);
+		await session.close(context);
 	});
 });
