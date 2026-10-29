@@ -27,15 +27,17 @@ slice spec's section citations are for orientation, not a reading limit (owner, 
 
 - **L1** (`src/next/contracts`, `src/next/data`): contracts, params and identity, argument checks, principal keys,
   errors. `index.ts` for apps, `internal.ts` for Chord's own code.
-- **Slices 1, 2, 3a, 3b, 4a, 4b, 5, 6a, 6b** (committed; 5 `4a5b45c45`, 6a and 6b 2026-10-27/28): `src/next/documents`, `state`, `host`, `jobs`, `link`,
-  `remote`, `store`; examples 01-25; benchmarks in `benchmarks.md`.
+- **Slices 1, 2, 3a, 3b, 4a, 4b, 5, 6a, 6b, 8** (committed; 5 `4a5b45c45`, 6a and 6b 2026-10-27/28, 8 2026-10-28): `src/next/documents`, `state`, `host`, `jobs`, `link`,
+  `remote`, `store`, `registries`; examples 01-30 (Durable's 35-37); benchmarks in `benchmarks.md`.
 - **Chord's shared code** (upstream pi): `src/watch.ts` (`Watch`, `NativeWatch`, `WatchHandle`, `WatchEnd`,
   `NativeWatchable`), Delta (`track`, `diffRevisions`, `applyImmutable`, encoders, `PendingOps`, `appendText`),
   context, JSON, output, SQLite drivers.
 
 ## The slices
 
-Order (owner, 2026-10-22: routines and jobs before the store and reload).
+Order (owner, 2026-10-22: routines and jobs before the store and reload; 2026-10-27: slice 8 before slice 7, whose
+reload has to reload real registries; 2026-10-29: slice 7 split into 7a, 7b, 7c; the app kit as slices 10 and 11;
+telemetry last, since it instruments the app kit too).
 
 | # | Slice | In short |
 | --- | --- | --- |
@@ -43,13 +45,17 @@ Order (owner, 2026-10-22: routines and jobs before the store and reload).
 | 2 | **Failures and natives** | `self.open`, activation failures and recovery, backoff, the drain, timeouts |
 | 3a | **Remote objects over one link** | remote contracts, principals, variants, a memory link, the message format, holds, calls, one message per commit (no relay, no drops) |
 | 3b | **Surviving drops** | re-holds, parking, `ref.state`, `host.hold`, `ref.retry()`, `linger` |
-| 4a | **Links and relays** | host kinds, placement, routes, two-sided links, relays and principals, IPC and WebSocket, flow control, heartbeat |
+| 4a | **Links and relays** | host kinds, host addresses (`placement` then), routes, two-sided links, relays and principals, IPC and WebSocket, flow control, heartbeat |
 | 4b | **Authority and housekeeping** | revocation, cycles across hosts, `host.references`, `host.activity`, size limits, compression |
 | 5 | **Routines and jobs** | `self.routines`, `self.job` |
 | 6a | **The store** | the store (backends, tables, queries, writes, commit queue, outbox, documents engine, migrations, export), persisted documents, `self.table`, keyed watches and retirement |
 | 6b | **Durable and jobs on the store** | persisted jobs, Durable's `StoreStorage`, the Chord source over Durable's views (`self.follow`) |
-| 7 | **Reload and rollout** | plugin loading, staging, swaps and restarts, revisions, `accepts` in use |
-| 8 | **Registries and `host.root`** | registries, `self.writable`, `retryOn`, a `RegistryReader` for Durable, `host.root` (`chord(fn, context)` and the harness object are p3's base code) |
+| 8 | **Registries and `host.root`** | registries, `self.writable`, `retryOn`, Durable's `registryReader`, `host.root` (`chord(fn, context)` and the harness object are p3's base code) |
+| 7a | **The dependency model** | requests that outlive providers, parked attempts without timers, wakes, the publication gate, getters, registries as dependencies, `parked_long` (`slice-7a.md`, `dependencies/model.md`) |
+| 7b | **Reload in the kernel** | `host.reload`: staging, commit, rollback; swaps, restarts, removal and re-serving; holds and `accepts` across a reload; jobs and registries across a reload; per-name wakes (`slice-7b/` brief) |
+| 7c | **Loader and dev** | `chord/next/loader` (discovery, `buildFacet`, `evaluateFacet`, `pluginFile`, dependencies) and `chord/next/dev` (watcher, reload control across hosts) |
+| 10 | **HTTP and workers** | `chord/next/http` (server, `Http` registry, responses as descriptions, WebSocket entry) and `chord/next/workers` (a worker per address, IPC, idle stop) |
+| 11 | **Web and TUI** | `chord/next/web` (page host, React hooks) and `chord/next/tui` (launcher, sandbox), from p2's code |
 | 9 | **Telemetry** | spans, events, metrics across hosts |
 
 The playground (`apps/chord-playground`) moves to the new code once slice 4 exists. Round-3 cuts (C3-C16) and
@@ -74,6 +80,7 @@ pattern, no code. Decided cuts are noted where they apply.
 | 3 | park deadline (= `readyTimeout`, C13) | 3b |
 | 3 | `host.activity` (keep-alive counts) | 4b |
 | 3 | `host.root(fn, …)` for code outside objects | 8 |
+| 3 | requests that outlive providers: the destination by address, the publication gate, the unbound index, the check against the selected provider only; the start barrier's first outcomes (decision (a)) | 7a |
 | 4 | principal type `P`, links stamp principals, principal keys in identity | 3a |
 | 4 | revocation (`revokedBy`, `host.revoke`, propagation to children) | 4b |
 | 5 | `local` types: params, members, checked arguments (Q15), results unchecked | 1 |
@@ -83,6 +90,7 @@ pattern, no code. Decided cuts are noted where they apply.
 | 6 | lifecycle, one object per identity, lifetime from kind and params (Q-A), factory, activation, ending | 1 |
 | 6 | failure causes, backoff per identity, dependency recovery (R18) | 2 |
 | 6 | `retryOn` | 8 (first independently living source: registries) |
+| 6 | parked attempts (no dependency deadline or backoff, wakes on every change, retry passing on), `FailureCause` `waiting`, `parked_long` and the authoring rules against cycles | 7a |
 | 6 | cycle rejection on one host (Q5) | 1 |
 | 6 | cycle rejection across hosts (activation chain in hold headers) | 4b |
 | 6 | shared store with per-principal views; worker-wide native owners; natives following a relocation | doc (1, 3, 2) |
@@ -90,6 +98,7 @@ pattern, no code. Decided cuts are noted where they apply.
 | 7 | per-reference watches (released with their reference) | 1 |
 | 7 | `ctx.get` (call-scoped references) | 3a |
 | 7 | `ref.state` (tagged), `ref.retry()`, `host.hold`, calls parking, failed references | 3b |
+| 7 | getters wait through `waiting`; `host.hold` throws only for invalid params | 7a |
 | 7 | `ref.variant` as discriminant, `RefIn` (C15: no `inVariant`/`expectVariant`) | 3a |
 | 7 | `state: false` (C8: cut) | - |
 | 7 | optional dependencies as registries | doc (8) |
@@ -117,6 +126,7 @@ pattern, no code. Decided cuts are noted where they apply.
 | 15 | `defineJob`, `self.job`, intent/run/finish, state documents, dedupe (Q9), `busy`, `running`, blocked `finish` (C3 decided); persistence, resume, restart limit; `accepts` in use | 5 (persistence: 6b; `accepts` and reload: 7) |
 | 16 | `defineFacet<P>`, facet as declarations only (documents and routines removed in 6a) | 1, 6a |
 | 17 | registries: `defineRegistry`, contributions, `compose`, versions (Q8), use-site guards | 8 |
+| 17 | registry readers as parked dependencies (`waiting`), `host.registry` waiting, the last good value dropped when a contribution leaves | 7a |
 | 18 | `constant(value)`, start data as a core object (`SessionInfo`) | 1 (core facet pattern: 4a) |
 | 18 | platform bindings as core objects | doc (8) |
 | 19 | `host.references` (presence) | 4b |
@@ -161,7 +171,7 @@ deleted (the slice's spec and code are the record). Moved here from `carry-over.
 - **`map(bytes())` is refused at declaration** ("unsupported keyword `~refine`"): TypeBox's `Record` copies the bytes
   schema's check as an enumerable key, which the snapshot walk refuses. An L1 bug found in slice 3a, not fixed yet.
 
-### Slice 7: reload and rollout
+### Slice 7b: reload and rollout (7a: the dependency model, `slice-7a.md`)
 
 - **A native restart drains first** (owner, 2026-10-26): park new calls, await running calls (bounded by
   `closeTimeout`), then close the natives and restart; a call outliving the drain is cut off by the seal fence. Running
@@ -183,6 +193,12 @@ deleted (the slice's spec and code are the record). Moved here from `carry-over.
   (`local`, empty params) stays broken until the host restarts; slice 7 maps the records to the new version (or blocks
   the old runs) on reload.
 
+- **Publications wake per name** (from slice 7a): `UnboundIndex.wakeAll()` wakes every indexed request, right for the
+  one publication 7a has; a reload's or an install's publication wakes only the requests of the names it serves
+  (`wake(names)`), or every refused hold on the host would re-run its start.
+- **The reload handover of a parked attempt** (from slice 7a): the new attempt's requests bind before the old ones are
+  released (M§3.9); the mechanism (an attempt releasing its predecessor's references after binding its own) was removed
+  in 7a with R18's kept references, its only feeder.
 - **Routines on reload** (from slice 5): the handover per object, bounded by `closeTimeout`; calls do not wait for it.
 - **Jobs on reload** (from slice 5): `accepts` in use (args and result mapped forwards once per run; `blocked
   { version }` without an adapter or for a newer version); when an older run's state document may migrate while its
@@ -211,14 +227,13 @@ deleted (the slice's spec and code are the record). Moved here from `carry-over.
   internal ones are rebuilt; add matching only if a real need appears. (W1.)
 - **Retrying broken failures:** reload retries a broken object as `ref.retry()` does (`ChordObject.retry`: the
   backoff skipped, an attempt now; holders are told `loading`). (Slices 2, 3b.)
-
-### Slice 8: registries and `host.root`
-
-- **Durable's views from other objects** (from slice 6b): the harness carried in a registry entry, so an object other
-  than the one that opened Durable can `self.follow` its views.
-
-- Specified in `slice-8.md` (decided 2026-10-27): `host.root` (D3), `retryOn` (D2), registries recomposing in the
-  owner's flush (W4); `host.activity` on the facet's host dropped (nothing needs it).
+- **Registries on reload** (from slice 8 §6): a reload replaces a plugin's contributions and a provider atomically, in
+  one batch (staging composes nothing, decision D1 of "Review round 1"); the record keeps the provider, facet
+  contributions by plugin and object contributions by object apart for it (`RegistryRecord.serve` refuses a second
+  serve today). Older registry readers across a reload of the provider (their mapped values follow the new
+  `accepts[old].value`). A `writable` across a pure swap: the new factory makes a new `self.writable(initial)`, so a
+  contribution goes back to its initial value until the restarted routine sets it (MCP's tools would vanish briefly).
+  `retryOn` watches across a reload (a reload retries failed objects anyway). (Slice 8 spec.)
 
 ### Slice 9: telemetry
 
