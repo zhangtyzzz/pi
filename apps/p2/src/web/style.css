@@ -42,7 +42,6 @@
 	--row: 44px;
 	--control: 40px;
 	--control-sm: 32px;
-	--tool-icon: 16px;
 	--radius: 4px;
 
 	--fs-xs: 11px;
@@ -57,7 +56,8 @@
 
 	--safe-top: env(safe-area-inset-top, 0px);
 	--safe-bottom: env(safe-area-inset-bottom, 0px);
-	--chat-width: 760px;
+	/* The transcript and the composer under it: centred, at most Elanor's width for running text. */
+	--chat-width: var(--semantic-dimension-size-max-width-text);
 	--chat-size: 100%;
 
 	font-family: var(--sans);
@@ -93,7 +93,6 @@
 }
 @media (min-width: 700px) {
 	:root {
-		--chat-width: 1120px;
 		--chat-size: calc(100% - 56px);
 	}
 }
@@ -110,38 +109,41 @@ body,
 	overflow: hidden;
 	overscroll-behavior: none;
 }
-button,
-input,
-textarea,
-select {
-	font: inherit;
-	color: inherit;
-}
-button {
-	cursor: pointer;
-	background: none;
-	border: 0;
-	padding: 0;
-	text-align: inherit;
-}
-button:disabled {
-	cursor: default;
-	opacity: 0.45;
+/* Element resets in a layer below Elanor's (elanor.css): its components style their own elements. */
+@layer p2-reset {
+	button,
+	input,
+	textarea,
+	select {
+		font: inherit;
+		color: inherit;
+	}
+	button {
+		cursor: pointer;
+		background: none;
+		border: 0;
+		padding: 0;
+		text-align: inherit;
+	}
+	button:disabled {
+		cursor: default;
+		opacity: 0.45;
+	}
+	h1,
+	h2,
+	h3,
+	p,
+	figure {
+		margin: 0;
+	}
+	a {
+		color: inherit;
+		text-underline-offset: 3px;
+	}
 }
 :focus-visible {
 	outline: 1px solid var(--text);
 	outline-offset: 2px;
-}
-h1,
-h2,
-h3,
-p,
-figure {
-	margin: 0;
-}
-a {
-	color: inherit;
-	text-underline-offset: 3px;
 }
 .muted {
 	color: var(--muted);
@@ -379,7 +381,6 @@ textarea.input {
 }
 .text-action,
 .footer-action,
-.tool-link,
 .title-cwd,
 .crumb,
 .cwd-pick span {
@@ -391,7 +392,6 @@ textarea.input {
 @media (hover: hover) {
 	.text-action:hover,
 	.footer-action:hover,
-	.tool-link:hover,
 	.title-cwd:hover,
 	.crumb:hover,
 	.cwd-pick:hover span {
@@ -668,14 +668,24 @@ textarea.input {
 }
 /* The transcript is a virtual list (use-chat-scroll.ts): `.rows` holds a spacer for the rows above, the rows near the
    viewport, and a spacer for the rows below. Each row carries its spacing to the row before it as padding, so its
-   measured height is everything it adds; a row is a flex column like the list it replaces (its margins stay inside). */
+   measured height is everything it adds; a row is a flex column like the list it replaces (its margins stay inside).
+   The rhythm (.pi/skills/p2-ui.md): a turn starts --s5 below what came before; its parts (thinking, words, wheels, the
+   answer, results) follow --s2 apart. One-line rows (a thought, a wheel, an incoming message's header) are --row tall,
+   so one turning into another never changes the height. */
 .rows {
 	display: flow-root;
 }
 .row {
 	display: flex;
 	flex-direction: column;
-	padding-top: var(--s4);
+	padding-top: var(--s5);
+}
+.row[data-gap="step"] {
+	padding-top: var(--s2);
+}
+/* A turn's first part is at least one row tall, as the working wheel it replaces: the turn never shrinks. */
+.row[data-lead] > * {
+	min-height: var(--row);
 }
 /* A transcript appearing (opening a conversation) fades in rather than snapping in (`.messages`). */
 @keyframes transcript-appear {
@@ -700,9 +710,7 @@ textarea.input {
 		animation: none;
 	}
 }
-/* A tool call ending one response and one starting the next stack like parallel calls. */
-.row.first,
-.row.joined {
+.row.first {
 	padding-top: 0;
 }
 .messages {
@@ -724,11 +732,6 @@ textarea.input {
 	display: flex;
 	justify-content: flex-end;
 	padding-left: 12%;
-}
-.guest-message {
-	justify-content: flex-start;
-	padding-right: 12%;
-	padding-left: 0;
 }
 .bubble {
 	max-width: 100%;
@@ -772,17 +775,6 @@ textarea.input {
 	gap: var(--s3);
 	min-width: 0;
 }
-.streaming > .md > :last-child::after {
-	content: "";
-	display: inline-block;
-	width: 6px;
-	height: 6px;
-	margin-left: var(--s1);
-	border-radius: 50%;
-	background: var(--muted);
-	vertical-align: middle;
-	animation: pulse 1s ease-in-out infinite;
-}
 .message-actions {
 	display: flex;
 	margin: calc(-1 * var(--s2)) 0 0 calc(-1 * var(--s2));
@@ -801,9 +793,6 @@ textarea.input {
 }
 .reply-button:hover {
 	color: var(--text);
-}
-.guest-message .reply-button {
-	order: 1;
 }
 .user .reply-button {
 	opacity: 0;
@@ -905,148 +894,6 @@ textarea.input {
 	cursor: pointer;
 	list-style: none;
 }
-.working {
-	position: sticky;
-	bottom: 0;
-	z-index: 2;
-	display: flex;
-	align-self: flex-start;
-	align-items: center;
-	gap: var(--s1);
-	min-height: 20px;
-}
-.working span {
-	width: 4px;
-	height: 4px;
-	border-radius: 50%;
-	background: var(--muted);
-	animation: pulse 1.2s infinite ease-in-out;
-}
-.working span:nth-child(2) {
-	animation-delay: 0.15s;
-}
-.working span:nth-child(3) {
-	animation-delay: 0.3s;
-}
-
-/* Markdown */
-.md {
-	overflow-wrap: anywhere;
-}
-.md > * + * {
-	margin-top: 0.7em;
-}
-.marker > .md {
-	margin-top: var(--s2);
-}
-.md p,
-.md li {
-	line-height: 1.6;
-}
-.md ul,
-.md ol {
-	padding-left: 1.3em;
-}
-/* Browser margins off without outweighing the spacing between blocks (zero specificity). */
-:where(.md ul, .md ol, .md h3, .md h4, .md h5, .md h6) {
-	margin: 0;
-}
-/* Room for the widest marker: "10." needs more than "9." (Markdown sets --digits for two or more). */
-.md ol {
-	padding-left: calc(0.7em + var(--digits, 1) * 0.6em);
-}
-/* A short list inside a long one sets no --digits: it must not inherit the outer width. */
-.md li ol {
-	--digits: 1;
-}
-.md li + li {
-	margin-top: 0.25em;
-}
-/* Blocks inside an item (nested lists, code, quotes) sit as close as the next item would, whether the item's text
-   starts with markup or not; a loose item's paragraphs are as far apart as top-level ones. */
-.md li > :is(ul, ol, blockquote, div, hr) {
-	margin-top: 0.25em;
-}
-.md li > p + p {
-	margin-top: 0.7em;
-}
-/* Task items show their checkbox instead of a bullet (in a loose item it sits in the first paragraph). */
-.md li.task {
-	list-style: none;
-}
-.md li.task > input,
-.md li.task > p:first-child > input {
-	margin: 0 0.4em 0 -1.2em;
-	vertical-align: -0.1em;
-}
-.md h3,
-.md h4,
-.md h5,
-.md h6 {
-	font-size: 1em;
-	font-weight: var(--fw-strong);
-}
-.md > * + :is(h3, h4, h5, h6) {
-	margin-top: 1.1em;
-}
-.md code {
-	padding: 0.1em 0.35em;
-	border-radius: var(--radius);
-	background: var(--hover);
-	font-family: var(--mono);
-	font-size: 0.86em;
-}
-.md blockquote {
-	margin: 0;
-	padding-left: var(--s3);
-	border-left: 1px solid var(--line);
-	color: var(--muted);
-}
-.md hr {
-	border: 0;
-	border-top: 1px solid var(--line);
-}
-.md .table-wrap {
-	overflow-x: auto;
-	border: 1px solid var(--line);
-	border-radius: var(--radius);
-}
-.md table {
-	width: 100%;
-	border-collapse: collapse;
-	font-size: 0.92em;
-}
-/* Headers stay on one line; long cells wrap at words instead of making the table scroll far. */
-.md th {
-	white-space: nowrap;
-}
-.md td {
-	overflow-wrap: normal;
-}
-.md th,
-.md td {
-	padding: var(--s1) var(--s2);
-	border-right: 1px solid var(--line);
-	border-bottom: 1px solid var(--line);
-	text-align: left;
-}
-.md th {
-	background: var(--code);
-	font-weight: var(--fw-strong);
-}
-.md th:last-child,
-.md td:last-child {
-	border-right: 0;
-}
-.md tbody tr:last-child td {
-	border-bottom: 0;
-}
-.md .align-center {
-	text-align: center;
-}
-.md .align-right {
-	text-align: right;
-}
 .code-block {
 	overflow: hidden;
 	border: 1px solid var(--line);
@@ -1070,11 +917,6 @@ textarea.input {
 	font-size: var(--fs-sm);
 	line-height: 1.5;
 	tab-size: 3;
-}
-.md .code-block code {
-	padding: 0;
-	background: none;
-	font-size: inherit;
 }
 
 /* highlight.js tokens */
@@ -1162,15 +1004,12 @@ textarea.input {
 	color: #c9a4f5;
 }
 
-/* Thinking and tool calls share one compact row style. */
-.thinking button,
-.tool-head,
-.report-head {
+/* A thinking block in place: one compact row ("Thought ›") that opens to its text, muted and indented under it. */
+.thinking button {
 	display: flex;
 	align-items: center;
 	gap: var(--s2);
-	width: 100%;
-	min-height: var(--control-sm);
+	min-height: var(--row);
 	color: var(--muted);
 	font-size: var(--fs-sm);
 	text-align: left;
@@ -1185,8 +1024,7 @@ textarea.input {
 }
 .thinking-body {
 	margin-top: var(--s1);
-	padding-left: var(--s3);
-	border-left: 1px solid var(--line);
+	padding-left: calc(15px + var(--s2));
 	color: var(--muted);
 	font-size: var(--fs-sm);
 	overflow-wrap: anywhere;
@@ -1201,183 +1039,7 @@ textarea.input {
 .chev.open {
 	transform: rotate(90deg);
 }
-.tool {
-	min-width: 0;
-}
-/* Consecutive calls stack without a gap, within a response and across response boundaries. */
-.tool + .tool {
-	margin-top: calc(-1 * var(--s3));
-}
-.tool-header {
-	display: flex;
-	align-items: center;
-}
-.tool-head {
-	flex: 1;
-	min-width: 0;
-}
-.tool-icon {
-	display: grid;
-	flex: none;
-	place-items: center;
-	width: var(--tool-icon);
-	color: var(--muted);
-}
-.tool-name {
-	flex: none;
-	color: var(--text);
-	font-weight: var(--fw-strong);
-}
-.tool-summary {
-	flex: 1;
-	min-width: 0;
-	overflow: hidden;
-	font-family: var(--mono);
-	font-size: var(--fs-code);
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-.tool-state {
-	display: grid;
-	flex: none;
-	place-items: center;
-	color: var(--muted);
-	font-size: var(--fs-xs);
-}
-.tool-expand {
-	display: grid;
-	flex: none;
-	place-items: center;
-	width: var(--control-sm);
-	min-height: var(--control-sm);
-}
-.tool-body {
-	max-height: 60vh;
-	margin: var(--s1) 0 var(--s2);
-	overflow: auto;
-	border-top: 1px solid var(--line);
-	border-bottom: 1px solid var(--line);
-	background: var(--code);
-}
-.tool-body pre:not(.diff) {
-	margin: 0;
-	padding: var(--s2) var(--s3);
-	font-family: var(--mono);
-	font-size: var(--fs-code);
-	line-height: 1.5;
-	overflow-wrap: anywhere;
-	tab-size: 3;
-	white-space: pre-wrap;
-}
-.tool-body pre + pre {
-	border-top: 1px dashed var(--line);
-}
-.tool-command {
-	color: var(--text);
-}
-.tool-sub {
-	display: flex;
-	flex-direction: column;
-	gap: var(--s2);
-	padding: var(--s2) var(--s3);
-	font-size: var(--fs-sm);
-}
-.tool-link {
-	display: inline-block;
-	padding: var(--s1) 0 var(--s1) calc(var(--tool-icon) + var(--s2));
-	color: var(--muted);
-	font-size: var(--fs-sm);
-}
-.tool-body pre.tool-error {
-	color: var(--bad);
-}
-/* Code mode scripts: the first lines until "Show all"; highlighted exactly like write's content. */
-.script.clip pre {
-	max-height: calc(6 * 1.5 * var(--fs-code) + var(--s2));
-	overflow: hidden;
-}
-/* A failed script is still source: only its output takes the card's error color. */
-.tool.error .script pre {
-	color: var(--text);
-}
-.script + pre {
-	border-top: 1px dashed var(--line);
-}
-.tool-link.script-more {
-	padding-left: var(--s3);
-}
-/* Calls a tool made to other tools: compact status rows aligned with the card's summary. */
-.nested-calls {
-	margin: 0 0 var(--s1);
-	padding: 0;
-	list-style: none;
-}
-.nested-call {
-	display: grid;
-	grid-template-columns: var(--tool-icon) auto minmax(0, 1fr) auto;
-	column-gap: var(--s2);
-	align-items: center;
-	min-height: 24px;
-	padding-left: calc(var(--tool-icon) + var(--s2) + var(--depth, 0) * var(--s3));
-	color: var(--muted);
-	font-size: var(--fs-sm);
-}
-.nested-state {
-	display: grid;
-	place-items: center;
-}
-.nested-call.error .nested-state,
-.nested-call.interrupted .nested-state {
-	color: var(--bad);
-}
-.nested-name {
-	color: var(--text);
-}
-/* A one-shot agent's row opens its transcript. */
-.nested-open {
-	color: var(--text);
-	text-align: left;
-	text-decoration: underline dotted;
-	text-underline-offset: 3px;
-}
-.nested-open:hover {
-	text-decoration-style: solid;
-}
-.nested-summary,
-.nested-detail {
-	min-width: 0;
-	overflow: hidden;
-	font-family: var(--mono);
-	font-size: var(--fs-code);
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-.nested-time {
-	color: var(--faint);
-	font-size: var(--fs-xs);
-	font-variant-numeric: tabular-nums;
-}
-.nested-detail {
-	grid-column: 2 / -1;
-	padding-bottom: var(--s1);
-}
-.nested-error {
-	display: -webkit-box;
-	-webkit-box-orient: vertical;
-	-webkit-line-clamp: 2;
-	line-clamp: 2;
-	color: var(--bad);
-	overflow-wrap: anywhere;
-	white-space: pre-wrap;
-}
 /* Artifact and file cards: the body opens the viewer; the bordered end downloads. */
-.file-tool {
-	padding: var(--s1) 0;
-}
-.tool + .file-tool,
-.file-tool + .tool {
-	margin-top: 0;
-}
 .file-card {
 	display: flex;
 	align-items: stretch;
@@ -2330,23 +1992,90 @@ button.diff-number:hover {
 .workspace-toggle.on {
 	color: var(--text);
 }
-.report {
-	padding-left: var(--s3);
-	border-left: 1px solid var(--line);
+/* Someone else's message (Chat.tsx Incoming): a header line, the body indented under the name. One shape for every
+   kind: no coloured edges, no per-kind colours; kinds differ by icon and word. */
+.incoming {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
 }
-.report-head strong {
+.incoming-head {
+	display: flex;
+	align-items: center;
+	margin: 0 calc(-1 * var(--s2));
+}
+.incoming-from {
+	display: flex;
+	flex: 1;
+	align-items: center;
+	gap: var(--s2);
+	min-width: 0;
+	min-height: var(--row);
+	padding: 0 var(--s2);
+	border-radius: var(--radius);
+	color: var(--muted);
+	font-size: var(--fs-sm);
+	text-align: left;
+}
+button.incoming-from:hover {
+	background: var(--hover);
+}
+.incoming-icon {
+	display: grid;
+	flex: none;
+	place-items: center;
+	width: 18px;
+}
+.incoming-icon svg {
+	width: 16px;
+	height: 16px;
+}
+.incoming-line {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.incoming-name {
 	color: var(--text);
+	font-weight: var(--fw-strong);
 }
-.report-body {
-	margin-top: var(--s1);
+.incoming-chevron {
+	display: grid;
+	flex: none;
+	place-items: center;
+	color: var(--faint);
+}
+.incoming .edit-button,
+.incoming .reply-button {
+	align-self: center;
+}
+.incoming:hover .edit-button,
+.incoming:hover .reply-button {
+	opacity: 1;
+}
+.incoming-content {
+	min-width: 0;
+	padding-left: calc(18px + var(--s2));
 	font-size: var(--fs-md);
 	overflow-wrap: anywhere;
 }
-.report-body.clamp {
-	display: -webkit-box;
+/* About eight lines, then "Show more". */
+.incoming-body.clamped {
+	max-height: 12em;
 	overflow: hidden;
-	-webkit-line-clamp: 4;
-	-webkit-box-orient: vertical;
+}
+.incoming-plain {
+	white-space: pre-wrap;
+}
+.incoming-more {
+	min-height: var(--control-sm);
+	color: var(--muted);
+	font-size: var(--fs-sm);
+}
+.incoming-more:hover {
+	color: var(--text);
 }
 .images {
 	display: flex;
@@ -2584,6 +2313,12 @@ button.diff-number:hover {
 }
 .composer-bar > :last-child {
 	place-items: center end;
+}
+/* Send (or Stop) takes taps up to the composer's right edge: a thumb aiming at the glyph often lands right of it. */
+.composer-bar > .round:last-child {
+	width: calc(var(--control) + var(--x));
+	margin-right: calc(-1 * var(--x));
+	padding-right: var(--x);
 }
 .spacer {
 	flex: 1;
@@ -3151,6 +2886,21 @@ button.diff-number:hover {
 .sheet-head h2 {
 	font-size: var(--fs-lg);
 	font-weight: var(--fw-strong);
+}
+/* A page inside a sheet (a call's detail): Back before the title, which ellipsizes. */
+.sheet-head.has-back {
+	justify-content: flex-start;
+	padding-left: var(--bar-pad);
+}
+.sheet-head.has-back h2 {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.sheet-head .back svg {
+	transform: rotate(180deg);
 }
 .sheet-body {
 	overflow-y: auto;
@@ -3773,17 +3523,12 @@ button.history-edge:disabled {
 	margin: var(--s2) 0 0;
 }
 
-/* History tool cards (plugins/history): the entries found or read, each revealing itself in the transcript. */
-.history-hits {
-	margin: 0;
-	padding: 0;
-	list-style: none;
-	display: flex;
-	flex-direction: column;
-	gap: var(--s1);
-	font-size: var(--fs-sm);
+/* The lock of a sandboxed location: in the top bar's location line and on sidebar groups. */
+.title-lock {
+	display: inline-flex;
+	margin-right: 3px;
+	vertical-align: -1px;
 }
-.history-snippet {
-	color: var(--muted);
-	overflow-wrap: anywhere;
+.group-lock {
+	display: inline-flex;
 }
