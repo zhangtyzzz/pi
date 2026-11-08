@@ -39,3 +39,41 @@ and its working rules are in `handoff.md`.
 - **Startup building is measured with telemetry (owner, 2026-11-06):** spans for a server start (store, each base
   build, plugin discovery, each plugin build, the load), each worker start and each Apply, in the kit's telemetry
   store; to be specified as a small Chord change.
+- **Requirement for the skeleton: groupings and views are plugins (owner, 2026-11-07, relayed by session cbe4592b from
+  the owner's discussion with Christian, Max and David):** plugins contribute kinds of groupings (sessions per
+  env/cwd, projects, Discord servers, recent, ...), each grouping any addressable thing (sessions, envs, MCP servers,
+  project files) and rendering its own header and extras, without stepping on other plugins' groupings. Selecting an
+  addressable thing shows a view of it that plugins define: the main area is not always a transcript (an env: a file
+  browser, terminals, later VNC). Transcripts stay central; layouts must allow less transcript (an agent may compose a
+  view). The container (a sidebar or not) is open. Skeleton consequence: the page's route is a `(kind, id)` of an
+  addressable thing, the main area renders the view registered for that kind, group kinds and views are registries (web
+  and terminal). Access policies are out of scope for now but must fit later (session resources). Sketch: session
+  cbe4592b's artifact `p2-sidebar-groups`.
+  Addendum (owner, 2026-11-07, relayed by cbe4592b): go radical. The layout itself is plugin-defined (sidebar +
+  transcript + panel is one layout among others, shipped as the default "so as not to rattle cages"); the data model of
+  addressable things, groupings and views is the point and must allow free composition, also where the terminal cannot
+  show all of it; access control (which resources a project or session may use, who may see or do what) must attach to
+  the same model later, not be designed separately.
+- **No per-run authority; what is brought into a session is the control (owner, 2026-11-08: "there is no point in trying
+  to prevent prompt injections. that's why one should be able to define what is brought into a session"):** everyone
+  who may send in a session uses every resource in its selection, whoever started the run (as decided earlier: `origin`
+  is out, illusory against prompt injection). The stress test's "authority per run" gap (`model-stress/report.md`, both
+  reviews) is dropped; defining a session's resources (projects, lock-down, what is brought in) is the mechanism.
+- **Resource model direction (owner, 2026-11-08, voice walkthrough; to be specified and reviewed against p2's
+  features, then explained):** users (including a reserved instance user for company resources); resources, each owned
+  by one user, with its own login or none, never changing whose login it uses (Cristina's own Radius login is her own
+  resource); users create resources only for themselves, admins for the instance user; plugins create their built-in
+  resources (tools, prompt sections: one Durable extension = one resource) for the instance user when installed.
+  Groupings are plugin-defined and only show things (any number per session, computed like folders/recent or curated
+  like projects); a grouping "with resources" keeps its own resource list in its own plugin and tells core how to read
+  it; a session has exactly one resource source: its own list, its owner's defaults (the rule "everything I own plus
+  every instance resource I may use", so new tools appear by themselves) or one grouping with resources (one field on
+  the session: the invariant is structural). Everyone who may send in a session uses its whole list (no per-run
+  authority). One replaceable policy plugin (a registry with one provider; built-in default: the single user may do
+  everything) guards create, bring, add-member and similar typed operations through one guarded step in core; plugins
+  never know about ACL, SAML or Radius; the UI only renders server views (e.g. a per-user list of creatable kinds
+  computed with the policy). Workers follow their session's list live; the harness lets in only extensions whose
+  resource is on it (and belongs to the contributing plugin); resource plugins' per-session server views check the list.
+  Configured resources cover fine-grained cases (conversation access to one session with chosen actions, expiring list
+  entries). Rendering: renderers per contract and form (row, card, detail, ...) from any plugin, detail views assembled
+  from panels several plugins contribute. No stringly-typed APIs.

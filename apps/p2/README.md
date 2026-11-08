@@ -75,6 +75,9 @@ registered callback URL is unchanged.
 and at most 16 KiB; they are stored privately under `<data>/ssh/keys/`, never returned to a browser. Key generation
 and fetching an existing public key are available to every owner too, never guests. See [remote environments](docs/remote-envs.md).
 
+**Discord** (sidebar → More) sets up bots; a session's sheet → Discord links it to a channel: people there wake the
+sandboxed, locked session by mentioning the bot, and its answers come back as replies. See [Pi on Discord](docs/discord.md).
+
 API keys, pasted login codes and uploaded SSH keys pass through your tunnel or relay. Use a trusted transport.
 Keep the data directory, owner-key/tokens/revocations, provider credentials and SSH keys private; never commit them.
 
@@ -226,6 +229,13 @@ apply at once, an invalid one keeps the last valid projects and shows why. Proje
   machine, it keeps the subfolder (`.../pi/apps/p2` to `.../pi/apps/p2`) if the target has it, else it goes to the
   target place itself with a notice; that is read from the paths alone, so `/move` works while the session's machine is
   unreachable.
+
+`cacheWarming` (`"idle"` by default, `"streaming"` or `"off"`) keeps prompt caches warm as pi does: before the cache
+entry of a conversation's last request expires (5 minutes for Anthropic and Claude on Radius), p2 sends the request
+again with a one-token answer, while that is cheaper than writing the cache again. `"streaming"` warms while a run
+streams (up to an hour, e.g. during a long tool call); `"idle"` also warms the main conversation for up to 30 minutes
+after its run answered. The refreshes count in the conversation's cost. `stream.cacheRetention: "long"` writes 1-hour
+cache entries instead (at twice the input price).
 
 ### Voice mode
 
