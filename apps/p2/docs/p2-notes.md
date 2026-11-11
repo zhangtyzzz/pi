@@ -461,6 +461,11 @@ npm start
   a per-resource secret checked by the plugin's `RequestResolvers` contribution; the host stamps an owner
   principal with `access: "relay"`, a remote origin, and normal same-origin checks. They may sign in to model providers,
   but cannot mint local tokens or receive a local owner cookie. Credentials never reach web state.
+- **Server name** (core: `ServerName` in `src/runtime/server.ts`, `ServerNameSettings` for Settings, General): the
+  owner's name in `identity.json` while one is set, else the device's name read at start. The server owns it; Radius
+  keeps a copy for its shell: `?name=` on every host connect and `PUT /v1/servers/<id>/name` on a rename while
+  connected, so a rename never reconnects (which would drop every channel). A failed or offline rename goes with the
+  next connect; Radius never changes the name. Project places still name the machine by `os.hostname()`.
 - **Ports** (`plugins/ports`): server-owned `forwards.json` registry; owner **Envs → Ports** lists/adds/removes
   forwards and confirms public opt-in. Every forward is private by default and has an isolated
   `https://fwd--<brain label>--<random id>.rdtun.com/` address. Public forwards additionally have
@@ -469,6 +474,10 @@ npm start
   Host/Origin, public `X-Forwarded-*` and rewritten localhost redirects, without the relay secret. Pi's own
   port cannot be forwarded. Links appear after the owner opens Pi through Radius and survive restart;
   on-device Open uses localhost. Radius sees forwarded traffic; this is not a sandbox.
+- **Shell page and share links**: the brain keeps its page in the Radius shell, `<shell>/pi/<organization ID>/<brain>`,
+  from the relayed requests' shell origin (`radius.json` `shellPage`; one saved in the older `/pi/brains/…` form is
+  read in the current one). People a session is shared with by email get `<shell page>/s/<session>`. The shell names
+  the organization by its slug once it opens; a kept link names it by ID, which a slug change leaves valid.
 - The worker's root-only `ports` tool has `list/open/close`, fixes owner/peer attribution at its calling assistant
   entry, and denies guest/unattributed turns. It lists every forward and explicitly names all public endpoints,
   asks the model to obtain confirmation before publishing. As in Pi Mobile (67cdb4ca4) it may change or close any
@@ -510,6 +519,27 @@ sidebar rollup's or group's list (`page`). Only the top modal shows. The stack a
 tab's sessionStorage; URLs identify conversations (`/s/<id>` and `/s/<id>/c/<conversation>`) and section lists
 (`/list/<key>`), not modal payloads. Restored locators may be unavailable.
 
+- **Links that open in another tab.** In-app destinations are real `<a href>` links whose click handler is
+  `inPage(act)`: a plain primary click acts in the page; Cmd/Ctrl/Shift/Alt clicks, the middle button and "Open in
+  new tab" stay the browser's. Links take their address from `useLinkHref()` (`linkHref`): `routeHref`, which adds
+  the top layer when it is a viewer (`/s/<id>?viewer=<name>&at=<locator>`); sidebar rows and list pages have none, so
+  theirs is `routePath`.
+  A page loading such an address starts with that viewer over the conversation (`pathRoute(path, search)`); the
+  address bar then shows the conversation's path again. Only viewers are linkable: they only show content, and every
+  content fetch is authorized by its route, so a link (also another site's) cannot open a sheet that acts. Not yet
+  links: the "Back to main conversation" and parent-session buttons, peer-message attributions, Discord's bound
+  sessions.
+- **Framed by the Radius shell** (`src/web/shell-bridge.ts`). Through Radius the app runs in a frame of the shell
+  (`radius.earendil.com/pi/<organization>/<brain>`) on the brain's origin. The page names the shell's origin
+  (`<meta name="p2-shell-origin">`, relayed requests only), and the bridge speaks the frame's side of the shell's
+  `pi-shell` channel: `ready` on load, the route's `routeHref` as `location` after every navigation, and the shell's
+  `hello` base becomes the base of `linkHref`, so a link opened in another tab, or copied, is the shell's URL
+  (`…/pi/acme/<brain>/s/<id>`), not the frame's. The shell only replaces its URL with each report; the app's history
+  entries stay the tab's, so Back moves the frame. Messages go to the shell's origin only; nothing is posted when the
+  page is not framed or not relayed. The shell's side and the contract: Radius,
+  `client/src/views/pi-shell/frame-bridge.ts`. `test/p2/shell-bridge.test.ts` (origins, reports, base) and
+  `test/p2/ui-shell-frame.test.ts` (the real bundle framed by a stand-in shell on another site: mirrored URL, links,
+  one history entry per step, Back and Forward).
 - `push`: one step at the tap; `replace`: lateral changes and server/startup corrections. A correction can pass
   its captured route as `replace(next, expected)` so it cannot overwrite a later queued destination.
 - `close`: whole-modal ×/scrim/Escape, or a sheet/file parent; `reset`: workspace tabs, dropping visited files/commits.
@@ -520,8 +550,30 @@ tab's sessionStorage; URLs identify conversations (`/s/<id>` and `/s/<id>/c/<con
   custom changing scroll areas should do so too, with a key for the content they display.
 - Android Chromium uses one CloseWatcher while there is a step to undo, without adding history entries or browser
   page-back animation. Other browsers use history entries. With no internal step, system Back leaves the app.
-- Conversation destinations retain the workspace tab and terminal placement, but reset file/commit/search locations
-  and never carry the request to start a terminal. Server events never push.
+- Conversation destinations in the same session retain the workspace tab and terminal placement, but reset
+  file/commit/search locations and never carry the request to start a terminal; another session opens with its own
+  panels (below). Server events never push.
+- **Panels per session** (`src/web/session-panels.ts`): the right-hand panels (the workspace and its tab, the terminal
+  below the chat or on the workspace's Terminal tab, the side panel's plugin panel or activity) belong to the session
+  they were opened in. Problem: they used to stay open across a session switch, so a terminal opened in one session
+  also opened in the next. Now every route change remembers its session's panels in `localStorage` `p2-session-panels`
+  (per device, the last 200 sessions that had one open; closing them all forgets the session), and `conversationRoute`
+  opens another session with its own: as it last had them, none if it never had any. Within a session (its subagents'
+  and `/tree` conversations) the open panels stay, as before: the panels are the session's, its terminals are too, and
+  the workspace follows the shown conversation's location; only an activity, which is a block of one transcript, is
+  dropped in another conversation. A page load without history state of its own (a link, a new tab, a typed address,
+  the installed app's launch) restores the session's panels too; a reload or Back keeps its entry's route, as before.
+  Restored are the workspace's tab (not its folder or file) and the terminal's ID (a closed one falls back to the
+  newest running terminal); a terminal never starts on its own. Restoring never covers the chat: the workspace comes
+  back from 900 px (below, it takes the screen), the side panel from 700 px (below, it is a sheet), the terminal below
+  the chat always; a phone opens a session at its chat (the views plugin's rule). Sizes stay global per browser
+  (`useDragSize`: the side panel's and the workspace's widths, the terminal's height), as does the terminal's
+  preferred placement for a new terminal: a size suits the screen, not the session, and per-session widths would make
+  the chat column jump at every switch. The views plugin's layout was per session already
+  (`p2.views.layout:<session>`). Leaving a session detaches its terminal view; the programs keep running in the
+  terminal host and coming back reattaches from a VT snapshot (Terminals). A link that opens a viewer (`?viewer=`,
+  branch `artifact-newtab`) shows it above the session's restored panels; on phones the side panel waits beneath it
+  (`useSidePanelShown`). Test: `ui-session-panels.test.ts`.
 - **Drawer swipe** (`src/web/drawer-swipe.ts`, phone layout only): with no modal open, a drag toward the inline end
   (rightward; leftward in RTL) anywhere on the chat column (`main`) drags the drawer open; a drag toward the inline
   start on the open drawer or scrim drags it closed. Not on the workspace panel, which is full screen above the
@@ -1212,9 +1264,10 @@ startup fencing, the list marker, owner notice, worker-filtered Show logs and re
   SSH configuration comes from the envs plugin and the conversation's location environment; the separate `terminal-sessions.json`
   mapping is no longer read. Host keys use `ssh/known_hosts` and `pi-env-<name>` aliases. `envs.test.ts` exercises a
   remote terminal against a disposable localhost SSH fixture; no real remote host is used. Windows PTYs remain unsupported. The workspace has an owner-only
-  Terminal tab through the terminals plugin's `workspace-terminal` slot. Side and bottom panels carry across a
-  session switch, showing that session's terminals without starting one. Only explicit terminal-button/tab taps
-  request auto-start; attachment updates replace the route, never push or reopen a later destination.
+  Terminal tab through the terminals plugin's `workspace-terminal` slot. Side and bottom panels are remembered per
+  session (Browser navigation, Panels per session): another session opens with its own, never starting a terminal.
+  Only explicit terminal-button/tab taps request auto-start; attachment updates replace the route, never push or
+  reopen a later destination.
   Outdated hosts show Restart (ends all terminals), but idle outdated hosts are not automatically replaced yet; the
   agent's calls to an outdated host fail with that advice (`OUTDATED_HOST`); archiving closes its terminals with the
   viewer protocol every host speaks (list, then attach and force-close each).
@@ -1372,7 +1425,8 @@ startup fencing, the list marker, owner notice, worker-filtered Show logs and re
   which replaces it; a sheet on phones). Dragging a docked side panel's left edge resizes it; every side panel shares
   that width, kept per browser (`p2-side-panel-width`; `useDragSize` in `src/web/drag-size.ts`, which the sidebar,
   workspace and terminal use too). The viewer is a named `Route.layers` entry (Back and sessionStorage restoration);
-  picking an artifact pushes a viewer above the list.
+  picking an artifact pushes a viewer above the list. Cards and list rows are links to the viewer (`ViewerHref`,
+  Browser navigation), so a modified or middle click opens it in another tab.
   HTML/SVG use a sandboxed iframe, Markdown/text render safely,
   sent files use the conservative file preview. Nothing opens from a server update. `test/p2/artifacts.test.ts`
   covers fake-provider publication, versions, independent index, reload/restart, CSP, HEAD, guest isolation and
