@@ -16,6 +16,7 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import type { CredentialStore, ModelsStore } from "@earendil-works/pi-ai";
 import type { MutableModels } from "@earendil-works/pi-ai/models";
 import { arr, bool, nul, num, obj, opt, type Static, str, union } from "@earendil-works/pi-schema";
+import type { TelemetryStore } from "@earendil-works/pi-telemetry";
 import { Access } from "./access.ts";
 import {
 	type Ctx,
@@ -52,18 +53,13 @@ export type ServerInfo = Static<typeof ServerInfoSchema>;
  * their sockets.
  */
 export const Server = local("p2.server", {
-	version: 3,
+	version: 2,
 	params: {},
 	members: {
 		info: ServerInfoSchema,
 		/** Ends owners' live links and objects: one device's, or every owner's (remote and local sessions). */
 		revokeOwners: method(obj({ device: opt(str()) })),
 		revokeGuests: method(obj({ id: str() })),
-		/**
-		 * Ends custom views' frame links and their objects (docs/rooms.md): every frame of one opening of a view
-		 * (`viewKey`), or one frame's link.
-		 */
-		revokeFrames: method(obj({ view: opt(str()), link: opt(str()) })),
 	},
 });
 
@@ -146,6 +142,25 @@ export interface SessionWorkerControl {
 	observe(observer: FollowObserver<unknown>): FollowAttachment<Readonly<Record<string, WorkerState>>>;
 }
 
+/** What applying the user root's plugins did to one plugin. */
+export type PluginOutcome = {
+	readonly plugin: string;
+	/**
+	 * `applied` (rolled out), `removed`, `failed` (its build or a host's load; nothing rolled out on a build failure),
+	 * `refused` (unknown, or discovery: an invalid package, a name another root has).
+	 */
+	readonly outcome: "applied" | "removed" | "failed" | "refused";
+	readonly errors?: string[];
+};
+
+/** What a plugin reload did: per plugin, and the errors the server and workers logged meanwhile. */
+export type PluginApply = {
+	/** Nothing was tried: why. */
+	readonly refused?: string;
+	readonly plugins: PluginOutcome[];
+	readonly logs: string[];
+};
+
 /** The server's natives, contributed by the core facet from the start. */
 export type ServerParts = {
 	readonly resourceOptions: ServerResourceOptions;
@@ -161,6 +176,22 @@ export type ServerParts = {
 	 * test hosts without a store.
 	 */
 	readonly store?: Store;
+	/**
+	 * The telemetry store's reads (`<data>/telemetry.sqlite`, docs/p2-notes.md "Telemetry"): the owner's traces and metrics,
+	 * which `plugins/telemetry` serves to the owner and to agents of sessions neither shared nor locked. Absent in test
+	 * hosts without one.
+	 */
+	readonly telemetry?: TelemetryStore;
+	/**
+	 * The user plugin root (`<data>/plugins/`, plugins the owner or the agent writes) and its apply: builds the root's
+	 * changed plugins and rolls them out to the server and every worker, with the web and TUI bundles; per plugin what
+	 * happened (`reload_plugins`, docs/agent-plugins.md).
+	 */
+	readonly plugins: {
+		readonly root: string;
+		/** Reloads `requested` (default: every dirty plugin and the user root's), per plugin what happened. */
+		reload(requested?: readonly string[]): Promise<PluginApply>;
+	};
 };
 export const ServerNatives = defineRegistry<ServerParts, ServerParts | undefined>("p2.server-natives", { version: 1 });
 
@@ -219,14 +250,6 @@ export const Routes = keyedRegistry<RouteHandler>("p2.routes");
  */
 export type PageCookie = (request: IncomingMessage, access: RequestAccess) => string | undefined;
 export const PageCookies = keyedRegistry<PageCookie>("p2.page-cookies");
-
-/**
- * Links admitted by a token alone, by kind: `/chord/<kind>?token=…` (docs/rooms.md). The entry returns the principal
- * the link acts as (taking the token: single use), or undefined to refuse it. The request's cookies are never read:
- * the caller may be a sandboxed frame with an opaque origin (`Origin: null`).
- */
-export type LinkToken = (token: string, ctx: Ctx) => P2Principal | undefined | Promise<P2Principal | undefined>;
-export const LinkTokens = keyedRegistry<LinkToken>("p2.link-tokens");
 
 /** Authorized WebSocket upgrades by exact path. Plugins own their byte channels, not the server host. */
 export type UpgradeHandler = (
@@ -328,7 +351,6 @@ export function serveServerRegistries(facet: FacetHost): void {
 		Routes,
 		PageCookies,
 		Upgrades,
-		LinkTokens,
 		Authenticators,
 		ShareUrls,
 		SessionAccess,
@@ -358,11 +380,6 @@ export function serverCore(host: Host, info: ServerInfo, parts: ServerParts): Fa
 			},
 			revokeGuests: async ({ id }, ctx) => {
 				host.revoke({ guest: id }, ctx);
-				return null;
-			},
-			revokeFrames: async ({ view, link }, ctx) => {
-				if (view !== undefined) host.revoke({ view }, ctx);
-				if (link !== undefined) host.revoke({ link }, ctx);
 				return null;
 			},
 		}));

@@ -2,8 +2,9 @@
 // section of the sidebar: a flat list (Recents), groups of sessions (one per project, one per folder), or only a link to
 // its list (the Archive). The sidebar shows each rollup's relevant sessions (relevance and the rollup's window); its
 // list page shows them all, those that fell out of the window aged. No React: the views render what these return.
-import { placeSeed, projectSeed } from "../../glyphs/seed.ts";
+
 import type { Project } from "../../projects/contract.ts";
+import { placeSeed, projectSeed } from "../../projects/glyph-seed.ts";
 import type { RollupWindow } from "../../rollups/contract.ts";
 import type { Work } from "../../status/contract.ts";
 import type { Child } from "../../subagents/contract.ts";
@@ -11,7 +12,7 @@ import type { Session, SidebarWindow } from "../contract.ts";
 
 /** A session as the sidebar shows it: its catalog row with its subagents, its worker's state and an operation. */
 export type SidebarRow = Session & {
-	subagents: Child[];
+	subagents: readonly Child[];
 	/**
 	 * `work`: what each busy conversation does, by conversation ID. `unread`: a finished answer the owner has not read on
 	 * any device (see `SessionReads`).

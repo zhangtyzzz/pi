@@ -18,6 +18,7 @@ import {
 	CommandSearches,
 	Commands,
 	closeLayers,
+	getNavigation,
 	MoreIcon,
 	NEW_SESSION,
 	navigate,
@@ -48,9 +49,9 @@ import { Projects, placeOn } from "../projects/contract.ts";
 import { SidebarRollups } from "../rollups/contract.ts";
 import { Search, SessionReads } from "../search/contract.ts";
 import { SessionStatus } from "../status/contract.ts";
-import { Subagents } from "../subagents/contract.ts";
+import { type Child, Subagents } from "../subagents/contract.ts";
 import { SessionTree } from "../tree/contract.ts";
-import { BranchSheet } from "./BranchSheet.tsx";
+import { BRANCH_SHEET, BranchSheet, branchOf } from "./BranchSheet.tsx";
 import { SESSION_COMMANDS, SESSION_PAGES, SESSION_SEARCH } from "./commands.tsx";
 import { type Operation, type Session, Sessions, SidebarSettings, type SidebarWindow } from "./contract.ts";
 import { type DrawerRows, DrawerRowsContext } from "./contract.web.tsx";
@@ -75,6 +76,12 @@ import { publishPage, usePageData } from "./sidebar/page-data.ts";
 import { type CodeSource, RollupSheet } from "./sidebar/RollupSheet.tsx";
 import { folderName } from "./sidebar/Row.tsx";
 import { SidebarView, useNow } from "./sidebar/Sidebar.tsx";
+
+/** Closes the top layer only (a sheet), keeping those below it (a phone's drawer). */
+const closeTopLayer = () => void getNavigation().close((route) => ({ ...route, layers: route.layers.slice(0, -1) }));
+
+/** A session without subagents (one value, so its rows keep their identity across renders). */
+const NO_SUBAGENTS: readonly Child[] = [];
 
 const subscribeVisibility = (listener: () => void) => {
 	document.addEventListener("visibilitychange", listener);
@@ -161,7 +168,7 @@ function useSidebarData() {
 	const owner = useOwner();
 	const status = keptIn(useObject(SessionStatus, {}), "reader");
 	const agents = keptIn(useObject(Subagents, {}), "reader");
-	const { fail } = useComposerState();
+	const { fail, focusWhenOpen } = useComposerState();
 	const [list, edit] = useOptimisticCall(useReadable(keptIn(service, "owner", "guest")?.sessions), applyRow, fail);
 	const statuses = useReadable(status?.statuses);
 	const children = useReadable(agents?.children);
@@ -194,7 +201,7 @@ function useSidebarData() {
 						error: statuses?.[session.id]?.error,
 						unread: (answers?.[session.id] ?? 0) > (reads?.[session.id] ?? 0),
 					},
-					subagents: children?.[session.id] ?? [],
+					subagents: children?.[session.id] ?? NO_SUBAGENTS,
 					operation: operationOf(operations, session.id, dismiss),
 				};
 			}),
@@ -254,21 +261,40 @@ function useSidebarData() {
 		[settings, now, route.session],
 	);
 	// A session opens at its main conversation; `/s/<id>` would open conversation 1, which redirects there.
-	const onOpen = useCallback(
-		(session: string, conversation?: number) =>
-			navigate({ session, conversation: conversation ?? list?.find((each) => each.id === session)?.main ?? 1 }),
+	const targetOf = useCallback(
+		(session: string, conversation?: number) => ({
+			session,
+			conversation: conversation ?? list?.find((each) => each.id === session)?.main ?? 1,
+		}),
 		[list],
+	);
+	// The opened composer takes the focus, unless a touch opened it: that would open the keyboard, which a tap on the
+	// composer does.
+	const onOpen = useCallback(
+		(session: string, conversation?: number) => {
+			const target = targetOf(session, conversation);
+			focusWhenOpen(target);
+			navigate(target);
+		},
+		[targetOf, focusWhenOpen],
 	);
 	// The restored row is back at once; the session opens once the server has it (an archived one would bounce).
 	const onRestore = useCallback(
 		(id: string, conversation?: number) => {
 			if (!catalog) return;
+			const target = targetOf(id, conversation);
+			const cancel = focusWhenOpen(target);
 			edit({ id, change: { archivedAt: null } }, async () => {
-				await catalog.restore({ id }, BACKGROUND_CONTEXT);
-				onOpen(id, conversation);
+				try {
+					await catalog.restore({ id }, BACKGROUND_CONTEXT);
+				} catch (error) {
+					cancel();
+					throw error;
+				}
+				navigate(target);
 			});
 		},
-		[catalog, edit, onOpen],
+		[catalog, edit, targetOf, focusWhenOpen],
 	);
 	const searchHeld = useObject(Search, owner ? {} : undefined);
 	const search = liveIn(searchHeld, "owner");
@@ -324,6 +350,7 @@ function Sidebar() {
 	const { route, catalog, owner, fail, list, edit, rows, answers, reads, marks, search, settings, changeSettings } =
 		data;
 	const { rollups, rollupsHeld, entries, context, view, onOpen, onRestore } = data;
+	const { focusWhenOpen } = useComposerState();
 	// Project glyphs for groups and the sessions of flat lists; the owner's only (guests read no projects).
 	const glyphs = useMemo(() => (owner ? glyphsOf(context) : undefined), [owner, context]);
 	// Sessions a plugin's sidebar entry shows (the Familiar's, in `drawer-brand`) are left out of the rollups.
@@ -380,20 +407,30 @@ function Sidebar() {
 	);
 	// The row marks the chosen branch at once; the view follows once the session's main conversation moved.
 	const onBranch = useCallback(
-		(session: string, conversation: number) =>
+		(session: string, conversation: number) => {
+			const cancel = focusWhenOpen({ session, conversation });
 			edit({ id: session, change: { main: conversation } }, async () => {
-				await withTree(session, (tree) => tree.select({ conversation }, BACKGROUND_CONTEXT));
+				try {
+					await withTree(session, (tree) => tree.select({ conversation }, BACKGROUND_CONTEXT));
+				} catch (error) {
+					cancel();
+					throw error;
+				}
 				navigate({ session, conversation });
-			}),
-		[withTree, edit],
+			});
+		},
+		[withTree, edit, focusWhenOpen],
 	);
-	const [renaming, setRenaming] = useState<{ session: string; conversation: number }>();
-	const onRenameBranch = useCallback(
-		(session: string, conversation: number) => setRenaming({ session, conversation }),
-		[],
-	);
+	// A branch's rename sheet: a layer the branch row's "Rename branch…" opens (commands.tsx).
+	const branchSheet = useSheet(BRANCH_SHEET);
+	const renaming = branchOf(branchSheet?.locator);
 	const renamed = renaming && list?.find((each) => each.id === renaming.session);
 	const branch = renamed?.branches.find((each) => each.conversation === renaming?.conversation);
+	// A layer naming no branch of the loaded sessions (an old address, a branch of a deleted session) goes away.
+	const staleBranchSheet = branchSheet !== undefined && list !== undefined && branch === undefined;
+	useEffect(() => {
+		if (staleBranchSheet) closeLayers();
+	}, [staleBranchSheet]);
 	const renameBranch = (session: Session, conversation: number, label: string | null) =>
 		edit(
 			{
@@ -525,7 +562,6 @@ function Sidebar() {
 				connected={connected}
 				onOpen={onOpen}
 				onBranch={catalog ? onBranch : undefined}
-				onRenameBranch={catalog ? onRenameBranch : undefined}
 				onRestore={onRestore}
 				onNew={newSession}
 				onNewIn={ownerNewIn}
@@ -546,13 +582,14 @@ function Sidebar() {
 					onClose={closeLayers}
 				/>
 			)}
-			{renamed && branch && (
+			{catalog && renamed && branch && (
 				<BranchSheet
 					title={renamed.title}
 					conversation={branch.conversation}
 					label={branch.label}
 					onSave={(label) => renameBranch(renamed, branch.conversation, label)}
-					onClose={() => setRenaming(undefined)}
+					// Only the sheet closes: a phone's drawer it was opened over stays open.
+					onClose={closeTopLayer}
 				/>
 			)}
 			{sessionSheet && catalog && viewed && route.conversation === viewed.main && (
