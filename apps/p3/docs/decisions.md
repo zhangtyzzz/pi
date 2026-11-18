@@ -428,3 +428,21 @@ older entries that say `docs/<file>` or `apps/p3/docs/<file>` now are `apps/p3/d
   from 45 to 50, because after five parallel streams glibc keeps about 10 MiB it freed, the session's own data is
   about 4 MiB, and the glibc setting that removes it only helps on Linux; then to 55, because Node 26's workers settle
   about 7 MiB above Node 24's and 50 failed one run in five on Node 26).
+- **p3 ships as a single executable, likely (owner, 2026-11-17):** p3 itself is likely distributed as a Node single
+  executable application (SEA: one binary per platform with Node and p3's code inside), not installed from npm; the
+  packages (the API `@earendil-works/p3` that plugins type-check against, Chord and the others) still go to npm. First
+  step: the local release build (`release:p3:local`) also makes the executable, and the release tests, the memory test
+  and the bench run against it beside the npm install, measured overnight. Later the release uploads the executables.
+- **Base entries live in `src/bootstrap/` (owner, 2026-11-18; refines "Base entries are named after what they are"):**
+  the process entries (the `p3` command, the server, a session worker, the supervisor, the single executable's main)
+  move from `apps/p3/`'s root to `apps/p3/src/bootstrap/`, keeping their names; the root holds no `.ts` files.
+- **Packaging is its own work, later (owner, 2026-11-18; replaces the first step of "p3 ships as a single executable,
+  likely"):** the single-executable build made for the local release is taken out again; packaging p3 (an executable,
+  the native desktop apps) becomes a package of its own in p3 that someone takes on. The measurements stay as the
+  record: a Node 26 executable matched the npm install on Node 26 in every number, 156 MiB on disk (36 MB as xz); a
+  Node 24 executable cannot give workers their V8 flags and failed the memory budget; coding-agent's Bun binary is
+  117 MiB (42 MB as xz). The move of the entries to `src/bootstrap/` stays.
+- **Lock decisions wait for slice 6 (owner, 2026-11-18):** the lock sheet study's decisions (fewer layers, folding
+  locks into `harness.tools`, presets, the lock list; private: `/home/badlogic/chord-notes/research/p3-locks-sheet/`)
+  are taken when locks are built, not before. The owner is not convinced locks are any good: slice 6 starts by
+  questioning the mechanism itself, not only its details.
